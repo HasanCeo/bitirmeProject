@@ -42,7 +42,7 @@ DEFAULT_VIDEO_HEIGHT = 480
 DEFAULT_VIDEO_FPS = 30
 
 # ESP32-CAM Settings
-ESP32_CAM_IP = "192.168.1.100"                 # ESP32-CAM IP adresi (Seri monitörden kontrol edin)
+ESP32_CAM_IP = "172.20.10.10"                 # ESP32-CAM IP adresi (Seri monitörden kontrol edin)
 ESP32_CAM_STREAM_PORT = 81                     # MJPEG stream portu
 ESP32_CAM_HTTP_PORT = 80                       # HTTP API portu (capture, status, led)
 ESP32_CAM_STREAM_URL = f"http://{ESP32_CAM_IP}:{ESP32_CAM_STREAM_PORT}/stream"

@@ -100,7 +100,7 @@ class WebcamMonitor:
                 self.root.after(0, self._on_analysis_ready)
             except Exception as e:
                 logging.error(f"Failed to load analysis modules: {e}")
-                self.root.after(0, lambda: self.log_info(f"Analysis load failed: {e}"))
+                self.root.after(0, lambda err=str(e): self.log_info(f"Analysis load failed: {err}"))
         Thread(target=_load_heavy_modules, daemon=True).start()
 
         def _load_yolo():
@@ -658,8 +658,23 @@ class WebcamMonitor:
                 ret, frame = self.esp32_stream.read()
                 if not ret:
                     # ESP32-CAM'den henüz frame gelmemiş olabilir, bekle
+                    # Her 100 denemede durum bilgisi logla
+                    if not hasattr(self, '_esp32_wait_count'):
+                        self._esp32_wait_count = 0
+                    self._esp32_wait_count += 1
+                    if self._esp32_wait_count % 100 == 0:
+                        status = self.esp32_stream.get_status()
+                        logging.warning(
+                            f"ESP32-CAM frame bekleniyor "
+                            f"(deneme: {self._esp32_wait_count}, "
+                            f"connected: {status['connected']}, "
+                            f"frame_count: {status['frame_count']})"
+                        )
                     time.sleep(0.05)
                     continue
+                else:
+                    # Frame alındı, bekleme sayacını sıfırla
+                    self._esp32_wait_count = 0
             elif self.cap:
                 ret, frame = self.cap.read()
                 if not ret:
@@ -868,12 +883,17 @@ class WebcamMonitor:
             # Resize for display
             display_frame = resize_frame(display_frame, DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT)
             
-            # Convert to PhotoImage
-            image = Image.fromarray(display_frame)
-            photo = ImageTk.PhotoImage(image=image)
-            
-            # Update GUI in main thread
-            self.root.after(0, self.update_display, photo)
+            # Convert to PhotoImage and update GUI
+            if self.running:
+                try:
+                    image = Image.fromarray(display_frame)
+                    photo = ImageTk.PhotoImage(image=image)
+                    
+                    # Update GUI in main thread
+                    self.root.after(0, self.update_display, photo)
+                except Exception:
+                    # Window may have been destroyed
+                    break
             
             time.sleep(0.033)  # ~30 FPS
     
