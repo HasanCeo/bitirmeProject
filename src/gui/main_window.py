@@ -1,0 +1,888 @@
+"""
+Main GUI window for Security Camera Monitoring System
+"""
+
+import cv2
+import numpy as np
+import logging
+import time
+import os
+from datetime import datetime
+from threading import Thread
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from PIL import Image, ImageTk
+
+from src.detectors import MotionDetector, FireDetector
+from src.core.metadata_manager import MetadataManager
+from src.core.blacklist_manager import BlacklistManager
+from src.config.settings import (
+    DEFAULT_MOTION_THRESHOLD, DEFAULT_MOTION_MIN_AREA, DEFAULT_FIRE_MIN_AREA,
+    DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT, DEFAULT_VIDEO_FPS,
+    ESP32_CAM_STREAM_URL, ESP32_CAM_RECONNECT_DELAY, ESP32_CAM_TIMEOUT
+)
+from src.config.constants import (
+    COLOR_HUMAN, COLOR_FIRE, COLOR_VEHICLE, COLOR_PET,
+    DEFAULT_FRAME_SKIP_INTERVAL, DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT,
+    CANDIDATE_COLLECTION_FRAMES
+)
+from src.utils.image_utils import resize_frame
+from src.utils.esp32_stream import ESP32CamStream, test_connection
+
+
+class WebcamMonitor:
+    """Main application window for security camera monitoring"""
+    
+    def __init__(self, root):
+        """Initialize the application"""
+        self.root = root
+        self.root.title("Security Camera - Human & Fire Detection System")
+        self.root.geometry("1000x900")
+        self.root.configure(bg='#f0f0f0')
+        
+        # Configure modern style
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('Title.TLabel', font=('Segoe UI', 12, 'bold'), background='#f0f0f0')
+        style.configure('Heading.TLabel', font=('Segoe UI', 10, 'bold'), background='#f0f0f0')
+        style.configure('Status.TLabel', font=('Segoe UI', 9), background='#f0f0f0')
+        style.configure('Action.TButton', font=('Segoe UI', 9, 'bold'))
+        style.configure('Primary.TButton', font=('Segoe UI', 9))
+        
+        # Detection state
+        self.detection_enabled = True
+        self.fire_detection_enabled = True
+        self.car_detection_enabled = True
+        self.pet_detection_enabled = True
+        self.start_hour = 0
+        self.end_hour = 23
+        self.running = False
+        self.cap = None
+        self.esp32_stream = None
+        self.video_source = 0  # 0=webcam, "esp32cam"=ESP32-CAM, str=video dosyası
+        self.video_paused = False
+        self.total_frames = 0
+        self.current_frame_num = 0
+        
+        # Initialize light modules (sklearn/ultralytics not loaded yet)
+        self.metadata_manager = MetadataManager()
+        self.blacklist_manager = BlacklistManager()
+        self.image_analyzer = None
+        self.photo_manager = None
+        self.search_engine = None
+        
+        # Initialize detectors
+        self.motion_detector = MotionDetector(
+            threshold=DEFAULT_MOTION_THRESHOLD,
+            min_area=DEFAULT_MOTION_MIN_AREA,
+        )
+        self._yolo_detector = None  # Loaded in background for fast startup
+        self.fire_detector = FireDetector(min_area=DEFAULT_FIRE_MIN_AREA)
+        
+        # Setup GUI
+        self.setup_gui()
+        
+        # Load heavy modules (sklearn, ultralytics) in background - window appears immediately
+        def _load_heavy_modules():
+            try:
+                from src.analysis.image_analyzer import HumanImageAnalyzer
+                from src.core.photo_manager import PhotoManager
+                from src.core.search_engine import SearchEngine
+                self.image_analyzer = HumanImageAnalyzer()
+                self.photo_manager = PhotoManager(
+                    self.image_analyzer,
+                    self.metadata_manager,
+                    self.blacklist_manager
+                )
+                self.search_engine = SearchEngine(self.image_analyzer, self.metadata_manager)
+                self.root.after(0, self._on_analysis_ready)
+            except Exception as e:
+                logging.error(f"Failed to load analysis modules: {e}")
+                self.root.after(0, lambda: self.log_info(f"Analysis load failed: {e}"))
+        Thread(target=_load_heavy_modules, daemon=True).start()
+
+        def _load_yolo():
+            try:
+                from src.detectors.yolo_multi_detector import YoloMultiObjectDetector
+                detector = YoloMultiObjectDetector()
+                self._yolo_detector = detector
+                self.root.after(0, self._on_model_ready)
+            except Exception as e:
+                logging.error(f"Failed to load YOLO model: {e}")
+                self.root.after(0, lambda: self.log_info(f"Model load failed: {e}"))
+        Thread(target=_load_yolo, daemon=True).start()
+        
+        # Variables for frame processing
+        self.current_frame = None
+        self.last_motion_time = None
+        self.last_fire_time = None
+        self.frame_skip_counter = 0
+        self.frame_skip_interval = DEFAULT_FRAME_SKIP_INTERVAL
+        self.last_humans_detected = []
+        self.last_fires_detected = []
+        self.last_cars_detected = []
+        self.last_pets_detected = []
+        self.previous_human_tracks = set()
+        self.previous_car_tracks = set()
+        self.previous_pet_tracks = set()
+        
+        # Start camera automatically
+        self.root.after(100, self.start_detection)
+    
+    def setup_gui(self):
+        """Setup the GUI components"""
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="15")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Title
+        title_label = ttk.Label(main_frame, text="📹 Security Camera Monitoring System", 
+                               style='Title.TLabel')
+        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 15), sticky="w")
+        
+        # Left column frame
+        left_frame = ttk.Frame(main_frame)
+        left_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
+        
+        # Right column frame
+        right_frame = ttk.Frame(main_frame)
+        right_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Video display
+        video_frame = ttk.LabelFrame(left_frame, text="  📷 Camera View  ", padding="8")
+        video_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        
+        self.video_label = tk.Label(video_frame, text="Initializing camera...", 
+                                    bg="#1a1a1a", fg="#ffffff", 
+                                    font=('Segoe UI', 10))
+        self.video_label.pack(fill=tk.BOTH, expand=True)
+        
+        # Control panel
+        control_frame = ttk.LabelFrame(left_frame, text="  ⚙️ Controls  ", padding="10")
+        control_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # Status
+        status_container = ttk.Frame(control_frame)
+        status_container.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        ttk.Label(status_container, text="Status:", style='Heading.TLabel').grid(row=0, column=0, padx=(0, 10))
+        self.status_label = ttk.Label(status_container, text="Starting...", 
+                                      foreground="#ff8c00", style='Status.TLabel')
+        self.status_label.grid(row=0, column=1, sticky="w")
+        
+        # Detection toggles
+        self._create_toggle(control_frame, "Fire Detection:", 1, 
+                          lambda: setattr(self, 'fire_detection_enabled', 
+                                         self.fire_detection_var.get()))
+        self._create_toggle(control_frame, "Car Detection:", 2,
+                          lambda: setattr(self, 'car_detection_enabled',
+                                         self.car_detection_var.get()))
+        self._create_toggle(control_frame, "Pet Detection (🐱🐶):", 3,
+                          lambda: setattr(self, 'pet_detection_enabled',
+                                         self.pet_detection_var.get()))
+        
+        # Video source selection
+        video_source_frame = ttk.LabelFrame(control_frame, text="  📹 Video Source  ", padding="10")
+        video_source_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 10))
+        
+        ttk.Button(video_source_frame, text="🎥 Webcam", 
+                  command=self.use_webcam, style='Primary.TButton', width=15).grid(row=0, column=0, padx=(0, 5))
+        ttk.Button(video_source_frame, text="📡 ESP32-CAM", 
+                  command=self.use_esp32cam, style='Primary.TButton', width=15).grid(row=0, column=1, padx=(5, 5))
+        ttk.Button(video_source_frame, text="📁 Load Video", 
+                  command=self.load_video_file, style='Primary.TButton', width=15).grid(row=0, column=2, padx=(5, 5))
+        ttk.Button(video_source_frame, text="⏸️ Pause/Resume", 
+                  command=self.toggle_pause, style='Primary.TButton', width=15).grid(row=0, column=3, padx=(5, 0))
+        
+        # Time settings
+        time_frame = ttk.LabelFrame(control_frame, text="  🕐 Detection Hours  ", padding="10")
+        time_frame.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
+        
+        ttk.Label(time_frame, text="Start:", style='Heading.TLabel').grid(row=0, column=0, padx=(0, 5), sticky="e")
+        self.start_hour_var = tk.StringVar(value="0")
+        ttk.Spinbox(time_frame, from_=0, to=23, width=8, 
+                   textvariable=self.start_hour_var, font=('Segoe UI', 9)).grid(row=0, column=1, padx=5)
+        
+        ttk.Label(time_frame, text="End:", style='Heading.TLabel').grid(row=0, column=2, padx=(15, 5), sticky="e")
+        self.end_hour_var = tk.StringVar(value="23")
+        ttk.Spinbox(time_frame, from_=0, to=23, width=8, 
+                   textvariable=self.end_hour_var, font=('Segoe UI', 9)).grid(row=0, column=3, padx=5)
+        
+        ttk.Button(time_frame, text="Update", command=self.update_hours, 
+                  style='Action.TButton').grid(row=0, column=4, padx=(20, 0))
+        
+        # Search frame
+        search_frame = ttk.LabelFrame(left_frame, text="  🔍 Human Search  ", padding="10")
+        search_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 0))
+        
+        ttk.Label(search_frame, text="Search Query:", style='Heading.TLabel').grid(row=0, column=0, padx=(0, 10), pady=(0, 8), sticky="w")
+        self.search_query_var = tk.StringVar()
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_query_var, 
+                                font=('Segoe UI', 9), width=45)
+        search_entry.grid(row=0, column=1, columnspan=4, padx=(0, 10), pady=(0, 8), sticky=(tk.W, tk.E))
+        search_entry.insert(0, "e.g., red hat, blue car, red truck...")
+        search_entry.bind('<FocusIn>', lambda e: search_entry.delete(0, tk.END) if search_entry.get() == "e.g., red hat, blue car, red truck..." else None)
+        
+        ttk.Label(search_frame, text="Time Range:", style='Heading.TLabel').grid(row=1, column=0, padx=(0, 5), sticky="e")
+        ttk.Label(search_frame, text="Start:", style='Status.TLabel').grid(row=1, column=1, padx=(0, 5), sticky="e")
+        self.search_start_hour_var = tk.StringVar(value="0")
+        ttk.Spinbox(search_frame, from_=0, to=23, width=6, 
+                   textvariable=self.search_start_hour_var, font=('Segoe UI', 9)).grid(row=1, column=2, padx=5)
+        
+        ttk.Label(search_frame, text="End:", style='Status.TLabel').grid(row=1, column=3, padx=(10, 5), sticky="e")
+        self.search_end_hour_var = tk.StringVar(value="23")
+        ttk.Spinbox(search_frame, from_=0, to=23, width=6, 
+                   textvariable=self.search_end_hour_var, font=('Segoe UI', 9)).grid(row=1, column=4, padx=5)
+        
+        self.search_button = ttk.Button(search_frame, text="🔍 Search (loading...)", 
+                  command=self.search_humans, style='Action.TButton', state='disabled')
+        self.search_button.grid(row=1, column=5, padx=(15, 0))
+        search_frame.columnconfigure(1, weight=1)
+        
+        # Search results frame
+        results_frame = ttk.LabelFrame(right_frame, text="  📋 Search Results  ", padding="10")
+        results_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        
+        self.results_canvas = tk.Canvas(results_frame, height=220, bg='white', highlightthickness=1, 
+                                       highlightbackground='#d0d0d0')
+        results_scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.results_canvas.yview)
+        self.results_scrollable_frame = ttk.Frame(self.results_canvas)
+        
+        self.results_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
+        )
+        
+        self.results_canvas.create_window((0, 0), window=self.results_scrollable_frame, anchor="nw")
+        self.results_canvas.configure(yscrollcommand=results_scrollbar.set)
+        
+        self.results_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        results_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Blacklist panel
+        blacklist_frame = ttk.LabelFrame(right_frame, text="  🚨 Security Blacklist  ", padding="10")
+        blacklist_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        
+        input_frame = ttk.Frame(blacklist_frame)
+        input_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(input_frame, text="Description:", font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(0, 5))
+        self.blacklist_query_entry = ttk.Entry(input_frame, width=25, font=('Segoe UI', 9))
+        self.blacklist_query_entry.pack(side=tk.LEFT, padx=(0, 5))
+        
+        ttk.Label(input_frame, text="Type:", font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(5, 5))
+        self.blacklist_type_var = tk.StringVar(value='human')
+        type_combo = ttk.Combobox(input_frame, textvariable=self.blacklist_type_var, 
+                                 values=['human', 'vehicle', 'cat', 'dog', 'any'], width=10, state='readonly')
+        type_combo.pack(side=tk.LEFT, padx=(0, 5))
+        
+        ttk.Button(input_frame, text="➕ Add", command=self.add_to_blacklist).pack(side=tk.LEFT, padx=(5, 0))
+        
+        list_frame = ttk.Frame(blacklist_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.blacklist_listbox = tk.Listbox(list_frame, height=4, font=('Segoe UI', 9),
+                                            bg='#fff3cd', fg='#333333', selectmode=tk.SINGLE)
+        blacklist_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, 
+                                           command=self.blacklist_listbox.yview)
+        self.blacklist_listbox.config(yscrollcommand=blacklist_scrollbar.set)
+        self.blacklist_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        blacklist_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        ttk.Button(blacklist_frame, text="🗑️ Remove Selected", 
+                  command=self.remove_from_blacklist).pack(pady=(5, 0))
+        
+        self.update_blacklist_display()
+        
+        # Info display
+        info_frame = ttk.LabelFrame(right_frame, text="  📝 System Logs  ", padding="10")
+        info_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 0))
+        
+        self.info_text = tk.Text(info_frame, height=6, width=70, 
+                                 font=('Consolas', 9), wrap=tk.WORD,
+                                 bg='#fafafa', fg='#333333',
+                                 relief=tk.FLAT, borderwidth=1,
+                                 highlightthickness=1, highlightbackground='#d0d0d0',
+                                 padx=8, pady=8)
+        self.info_text.pack(fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(info_frame, orient=tk.VERTICAL, command=self.info_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.info_text.config(yscrollcommand=scrollbar.set)
+        
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(1, weight=1)
+        left_frame.columnconfigure(0, weight=1)
+        left_frame.rowconfigure(0, weight=1)
+        right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(0, weight=1)
+        right_frame.rowconfigure(1, weight=0)
+        right_frame.rowconfigure(2, weight=1)
+        video_frame.columnconfigure(0, weight=1)
+        video_frame.rowconfigure(0, weight=1)
+    
+    def _create_toggle(self, parent, label_text, row, command):
+        """Helper to create toggle buttons"""
+        container = ttk.Frame(parent)
+        container.grid(row=row, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        ttk.Label(container, text=label_text, style='Heading.TLabel').grid(row=0, column=0, padx=(0, 10))
+        
+        var_name = label_text.lower().replace(' ', '_').replace(':', '').replace('(', '').replace(')', '')
+        # Initialize the toggle state from the corresponding *_enabled attribute if it exists
+        enabled_attr = f"{var_name}_enabled"
+        initial_value = getattr(self, enabled_attr, False)
+        var = tk.BooleanVar(value=initial_value)
+        setattr(self, f'{var_name}_var', var)
+        
+        ttk.Checkbutton(container, text="Enabled", variable=var, command=command).grid(row=0, column=1, sticky="w")
+    
+    def _on_analysis_ready(self):
+        """Called when analysis modules (search, photo save) are loaded"""
+        self.search_button.config(text="🔍 Search", state='normal')
+        self.log_info("Analysis modules ready")
+    
+    def _on_model_ready(self):
+        """Called when YOLO model is loaded"""
+        self.log_info("Model ready")
+    
+    def update_hours(self):
+        """Update detection hours"""
+        try:
+            start = int(self.start_hour_var.get())
+            end = int(self.end_hour_var.get())
+            if 0 <= start <= 23 and 0 <= end <= 23:
+                self.start_hour = start
+                self.end_hour = end
+                self.log_info(f"Detection hours updated: {start:02d}:00 - {end:02d}:59")
+            else:
+                messagebox.showerror("Error", "Hours must be between 0 and 23")
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid numbers")
+    
+    def add_to_blacklist(self):
+        """Add entry to blacklist"""
+        query = self.blacklist_query_entry.get().strip()
+        object_type = self.blacklist_type_var.get()
+        
+        if not query:
+            messagebox.showwarning("Warning", "Please enter a description")
+            return
+        
+        self.blacklist_manager.add_entry(query, object_type)
+        self.update_blacklist_display()
+        self.blacklist_query_entry.delete(0, tk.END)
+        self.log_info(f"🚨 Added to blacklist: {object_type} - {query}")
+        messagebox.showinfo("Success", f"Added to blacklist:\n{query}")
+    
+    def remove_from_blacklist(self):
+        """Remove entry from blacklist"""
+        selection = self.blacklist_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select an entry to remove")
+            return
+        
+        index = selection[0]
+        if 0 <= index < len(self.blacklist_manager.blacklist):
+            entry = self.blacklist_manager.blacklist[index]
+            self.blacklist_manager.remove_entry(index)
+            self.update_blacklist_display()
+            self.log_info(f"Removed from blacklist: {entry['query']}")
+    
+    def update_blacklist_display(self):
+        """Update blacklist listbox display"""
+        self.blacklist_listbox.delete(0, tk.END)
+        for entry in self.blacklist_manager.blacklist:
+            display_text = f"[{entry['object_type'].upper()}] {entry['query']}"
+            self.blacklist_listbox.insert(tk.END, display_text)
+    
+    def search_humans(self):
+        """Search for objects matching query"""
+        try:
+            if self.search_engine is None:
+                messagebox.showinfo("Loading", "Search is still loading. Please wait a moment.")
+                return
+            query = self.search_query_var.get().strip()
+            if not query:
+                messagebox.showwarning("Warning", "Please enter a search query")
+                return
+            
+            start_hour = int(self.search_start_hour_var.get())
+            end_hour = int(self.search_end_hour_var.get())
+            
+            if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+                messagebox.showerror("Error", "Hours must be between 0 and 23")
+                return
+            
+            # Clear previous results
+            for widget in self.results_scrollable_frame.winfo_children():
+                widget.destroy()
+            
+            # Perform search
+            matching_images = self.search_engine.search(query, start_hour, end_hour)
+            
+            # Display results
+            if not matching_images:
+                no_result_label = ttk.Label(self.results_scrollable_frame, 
+                                           text=f"❌ No search results found\n\nQuery: '{query}'\nTime range: {start_hour:02d}:00 - {end_hour:02d}:59",
+                                           foreground="#666666", 
+                                           font=('Segoe UI', 10))
+                no_result_label.grid(row=0, column=0, padx=20, pady=30, sticky="w")
+            else:
+                result_label = ttk.Label(self.results_scrollable_frame, 
+                                        text=f"✅ {len(matching_images)} match(es) found:",
+                                        font=('Segoe UI', 11, 'bold'),
+                                        foreground="#2d5016")
+                result_label.grid(row=0, column=0, columnspan=4, padx=10, pady=(10, 15), sticky="w")
+                
+                # Display images in a grid
+                row = 1
+                col = 0
+                max_cols = 4
+                
+                for image_path, image_file, confidence in matching_images:
+                    img_frame = ttk.Frame(self.results_scrollable_frame)
+                    img_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+                    
+                    try:
+                        img = cv2.imread(image_path)
+                        if img is not None:
+                            h, w = img.shape[:2]
+                            max_size = 150
+                            if w > h:
+                                new_w = max_size
+                                new_h = int(h * (max_size / w))
+                            else:
+                                new_h = max_size
+                                new_w = int(w * (max_size / h))
+                            
+                            img_resized = cv2.resize(img, (new_w, new_h))
+                            img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+                            img_pil = Image.fromarray(img_rgb)
+                            img_tk = ImageTk.PhotoImage(image=img_pil)
+                            
+                            img_label = tk.Label(img_frame, image=img_tk)
+                            img_label.image = img_tk
+                            img_label.pack()
+                            
+                            info_text = f"{image_file[:25]}...\nConfidence: {confidence:.1%}"
+                            info_label = ttk.Label(img_frame, text=info_text, 
+                                                  font=('Segoe UI', 8),
+                                                  foreground="#555555",
+                                                  justify=tk.CENTER)
+                            info_label.pack(pady=(5, 0))
+                            
+                            col += 1
+                            if col >= max_cols:
+                                col = 0
+                                row += 1
+                    except Exception as e:
+                        logging.error(f"Error displaying image {image_path}: {e}")
+                        continue
+                
+                self.results_scrollable_frame.update_idletasks()
+                self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
+                
+                self.log_info(f"Search completed: {len(matching_images)} match(es) found")
+                
+        except Exception as e:
+            logging.error(f"Error in search_humans: {e}")
+            messagebox.showerror("Error", f"An error occurred during search: {str(e)}")
+    
+    def is_detection_time(self):
+        """Check if current time is within detection hours"""
+        current_hour = datetime.now().hour
+        if self.start_hour <= self.end_hour:
+            return self.start_hour <= current_hour <= self.end_hour
+        else:  # Overnight range
+            return current_hour >= self.start_hour or current_hour <= self.end_hour
+    
+    def start_detection(self):
+        """Start video detection"""
+        if self.video_source == "esp32cam":
+            # ESP32-CAM stream modu
+            self.esp32_stream = ESP32CamStream(
+                stream_url=ESP32_CAM_STREAM_URL,
+                reconnect_delay=ESP32_CAM_RECONNECT_DELAY,
+                timeout=ESP32_CAM_TIMEOUT
+            )
+            self.esp32_stream.open()
+            
+            if not self.esp32_stream.isOpened():
+                self.status_label.config(text="Status: ESP32-CAM Error", foreground="red")
+                self.video_label.config(text="ESP32-CAM bağlantı kurulamadı", bg="black", fg="red")
+                messagebox.showerror("Error", 
+                    f"ESP32-CAM'e bağlanılamadı!\n\n"
+                    f"URL: {ESP32_CAM_STREAM_URL}\n\n"
+                    f"Kontrol edin:\n"
+                    f"1. ESP32-CAM açık ve WiFi'ye bağlı mı?\n"
+                    f"2. IP adresi doğru mu? (settings.py)\n"
+                    f"3. Aynı ağda mısınız?")
+                return
+            
+            self.cap = None
+            self.total_frames = 0
+            
+            self.running = True
+            self.video_paused = False
+            self.status_label.config(text="Status: Running (ESP32-CAM)", foreground="green")
+            self.log_info(f"ESP32-CAM stream başlatıldı: {ESP32_CAM_STREAM_URL}")
+            
+            self.video_thread = Thread(target=self.process_video, daemon=True)
+            self.video_thread.start()
+            return
+        
+        # Webcam veya video dosyası modu (mevcut davranış)
+        self.cap = cv2.VideoCapture(self.video_source)
+        if not self.cap.isOpened():
+            source_name = "video file" if isinstance(self.video_source, str) else "webcam"
+            self.status_label.config(text="Status: Camera Error", foreground="red")
+            self.video_label.config(text=f"Could not open {source_name}", bg="black", fg="red")
+            messagebox.showerror("Error", f"Could not open {source_name}.")
+            return
+        
+        if self.video_source == 0:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, DEFAULT_VIDEO_WIDTH)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DEFAULT_VIDEO_HEIGHT)
+            self.cap.set(cv2.CAP_PROP_FPS, DEFAULT_VIDEO_FPS)
+        
+        if isinstance(self.video_source, str) and self.video_source != "esp32cam":
+            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.current_frame_num = 0
+            self.log_info(f"Video loaded: {os.path.basename(self.video_source)} ({self.total_frames} frames)")
+        else:
+            self.total_frames = 0
+        
+        self.running = True
+        self.video_paused = False
+        source_type = "video" if isinstance(self.video_source, str) else "camera"
+        self.status_label.config(text=f"Status: Running ({source_type})", foreground="green")
+        self.log_info(f"Started on {source_type}")
+        
+        self.video_thread = Thread(target=self.process_video, daemon=True)
+        self.video_thread.start()
+    
+    def stop_detection(self):
+        """Stop video detection"""
+        self.running = False
+        self.video_paused = False
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        if self.esp32_stream:
+            self.esp32_stream.release()
+            self.esp32_stream = None
+        self.status_label.config(text="Status: Stopped", foreground="red")
+        self.video_label.config(image='', text="Camera stopped")
+        self.log_info("Stopped")
+        
+        self.video_source = 0
+        self.total_frames = 0
+        self.current_frame_num = 0
+    
+    def load_video_file(self):
+        """Load a video file for processing"""
+        file_path = filedialog.askopenfilename(
+            title="Select Video File",
+            filetypes=[
+                ("Video files", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if file_path:
+            if self.running:
+                self.stop_detection()
+                time.sleep(0.2)
+            
+            self.video_source = file_path
+            self.log_info(f"Video: {os.path.basename(file_path)}")
+            
+            self.root.after(100, self.start_detection)
+            messagebox.showinfo("Video Loaded", f"Video loaded: {os.path.basename(file_path)}\nProcessing started automatically.")
+    
+    def use_webcam(self):
+        """Switch back to webcam mode"""
+        if self.running:
+            self.stop_detection()
+        
+        self.video_source = 0
+        self.log_info("Webcam mode")
+        self.start_detection()
+    
+    def use_esp32cam(self):
+        """Switch to ESP32-CAM mode"""
+        if self.running:
+            self.stop_detection()
+        
+        # Önce bağlantıyı test et
+        self.status_label.config(text="Status: ESP32-CAM bağlanıyor...", foreground="orange")
+        self.video_label.config(text="ESP32-CAM'e bağlanılıyor...", bg="#1a1a1a", fg="#ffcc00")
+        self.root.update_idletasks()
+        
+        self.video_source = "esp32cam"
+        self.log_info(f"ESP32-CAM mode: {ESP32_CAM_STREAM_URL}")
+        self.start_detection()
+    
+    def toggle_pause(self):
+        """Pause/resume video playback"""
+        if self.running:
+            self.video_paused = not self.video_paused
+            status = "Paused" if self.video_paused else "Running"
+            source_type = "video" if isinstance(self.video_source, str) else "camera"
+            self.status_label.config(text=f"Status: {status} ({source_type})", 
+                                    foreground="orange" if self.video_paused else "green")
+            self.log_info(f"Video {status.lower()}")
+    
+    def log_info(self, message):
+        """Add message to info text and log file"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] {message}"
+        self.info_text.insert(tk.END, log_message + "\n")
+        self.info_text.see(tk.END)
+        logging.info(message)
+    
+    def process_video(self):
+        """Process video frames in a separate thread"""
+        while self.running:
+            if self.video_paused:
+                time.sleep(0.1)
+                continue
+            
+            # Frame oku: ESP32-CAM veya cv2.VideoCapture
+            if self.video_source == "esp32cam" and self.esp32_stream:
+                ret, frame = self.esp32_stream.read()
+                if not ret:
+                    # ESP32-CAM'den henüz frame gelmemiş olabilir, bekle
+                    time.sleep(0.05)
+                    continue
+            elif self.cap:
+                ret, frame = self.cap.read()
+                if not ret:
+                    if isinstance(self.video_source, str) and self.video_source != "esp32cam":
+                        self.log_info("Video processing completed")
+                        self.root.after(100, self.stop_detection)
+                    break
+            else:
+                time.sleep(0.1)
+                continue
+            
+            if isinstance(self.video_source, str) and self.video_source != "esp32cam":
+                self.current_frame_num += 1
+            
+            self.frame_skip_counter += 1
+            should_process_detection = (self.frame_skip_counter % self.frame_skip_interval == 0)
+            
+            detection_active = self.is_detection_time() if self.detection_enabled else False
+            
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            display_frame = frame_rgb.copy()
+            
+            motion_detected = False
+            
+            if detection_active and should_process_detection:
+                motion_detected, motion_mask = self.motion_detector.detect_motion(frame)
+                
+                # Reset detections for this step
+                self.last_humans_detected = []
+                self.last_cars_detected = []
+                self.last_pets_detected = []
+                
+                if motion_detected and self._yolo_detector is not None:
+                    humans, vehicles, pets = self._yolo_detector.detect_all(frame)
+                    self.last_humans_detected = humans
+                    
+                    if self.car_detection_enabled:
+                        self.last_cars_detected = vehicles
+                    else:
+                        self.last_cars_detected = []
+                    
+                    if self.pet_detection_enabled:
+                        self.last_pets_detected = pets
+                    else:
+                        self.last_pets_detected = []
+                
+                if self.fire_detection_enabled:
+                    self.last_fires_detected = self.fire_detector.detect_fire(frame)
+                else:
+                    self.last_fires_detected = []
+            elif not detection_active:
+                self.last_humans_detected = []
+                self.last_fires_detected = []
+                self.last_cars_detected = []
+                self.last_pets_detected = []
+            
+            # Draw detections
+            if detection_active:
+                # Draw fire
+                if self.fire_detection_enabled and len(self.last_fires_detected) > 0:
+                    for (x, y, w, h) in self.last_fires_detected:
+                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), COLOR_FIRE, 3)
+                        cv2.putText(display_frame, "FIRE!", (x, y - 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_FIRE, 2)
+                    
+                    if should_process_detection:
+                        current_time = datetime.now()
+                        if self.last_fire_time is None or (current_time - self.last_fire_time).seconds > 3:
+                            self.log_info(f"FIRE DETECTED! Count: {len(self.last_fires_detected)}")
+                            self.last_fire_time = current_time
+                
+                # Draw humans
+                if len(self.last_humans_detected) > 0:
+                    for detection in self.last_humans_detected:
+                        x, y, w, h, track_id, mask = detection
+                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), COLOR_HUMAN, 2)
+                        cv2.putText(display_frame, f"Human ID:{track_id}", (x, y - 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_HUMAN, 2)
+                    
+                    if should_process_detection and self.photo_manager is not None:
+                        current_time = datetime.now()
+                        current_human_tracks = set()
+                        
+                        for detection in self.last_humans_detected:
+                            x, y, w, h, track_id, mask = detection
+                            current_human_tracks.add(track_id)
+                            
+                            if self.photo_manager.should_save_human(detection, current_time):
+                                self.photo_manager.add_candidate_frame(
+                                    track_id, frame, detection, current_time, is_human=True
+                                )
+                            elif track_id in self.photo_manager.human_track_candidates:
+                                num_candidates = len(self.photo_manager.human_track_candidates[track_id])
+                                if num_candidates < CANDIDATE_COLLECTION_FRAMES:
+                                    self.photo_manager.add_candidate_frame(
+                                        track_id, frame, detection, current_time, is_human=True
+                                    )
+                                elif num_candidates == CANDIDATE_COLLECTION_FRAMES:
+                                    filepath = self.photo_manager.get_best_candidate_and_save(track_id, is_human=True)
+                                    if filepath:
+                                        filename = os.path.basename(filepath)
+                                        self.log_info(f"HUMAN Saved: {filename}")
+                        
+                        lost_human_tracks = self.previous_human_tracks - current_human_tracks
+                        for lost_track_id in lost_human_tracks:
+                            if lost_track_id in self.photo_manager.human_track_candidates:
+                                filepath = self.photo_manager.get_best_candidate_and_save(lost_track_id, is_human=True)
+                                if filepath:
+                                    filename = os.path.basename(filepath)
+                                    self.log_info(f"HUMAN Saved: {filename}")
+                        
+                        self.previous_human_tracks = current_human_tracks
+                
+                # Draw vehicles
+                if self.car_detection_enabled and len(self.last_cars_detected) > 0:
+                    for vehicle_data in self.last_cars_detected:
+                        x, y, w, h, class_name, track_id, mask = vehicle_data
+                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), COLOR_VEHICLE, 2)
+                        cv2.putText(display_frame, f"{class_name.capitalize()} ID:{track_id}", (x, y - 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_VEHICLE, 2)
+                    
+                    if should_process_detection and self.photo_manager is not None:
+                        current_time = datetime.now()
+                        current_car_tracks = set()
+                        
+                        for vehicle_data in self.last_cars_detected:
+                            x, y, w, h, class_name, track_id, mask = vehicle_data
+                            current_car_tracks.add(track_id)
+                            
+                            if self.photo_manager.should_save_car(vehicle_data, current_time):
+                                self.photo_manager.add_candidate_frame(
+                                    track_id, frame, vehicle_data, current_time, is_human=False
+                                )
+                            elif track_id in self.photo_manager.car_track_candidates:
+                                num_candidates = len(self.photo_manager.car_track_candidates[track_id])
+                                if num_candidates < CANDIDATE_COLLECTION_FRAMES:
+                                    self.photo_manager.add_candidate_frame(
+                                        track_id, frame, vehicle_data, current_time, is_human=False
+                                    )
+                                elif num_candidates == CANDIDATE_COLLECTION_FRAMES:
+                                    filepath = self.photo_manager.get_best_candidate_and_save(track_id, is_human=False)
+                                    if filepath:
+                                        filename = os.path.basename(filepath)
+                                        self.log_info(f"CAR Saved: {filename}")
+                        
+                        lost_car_tracks = self.previous_car_tracks - current_car_tracks
+                        for lost_track_id in lost_car_tracks:
+                            if lost_track_id in self.photo_manager.car_track_candidates:
+                                filepath = self.photo_manager.get_best_candidate_and_save(lost_track_id, is_human=False)
+                                if filepath:
+                                    filename = os.path.basename(filepath)
+                                    self.log_info(f"CAR Saved: {filename}")
+                        
+                        self.previous_car_tracks = current_car_tracks
+                
+                # Draw pets
+                if self.pet_detection_enabled and len(self.last_pets_detected) > 0:
+                    for pet_data in self.last_pets_detected:
+                        x, y, w, h, class_name, track_id, mask = pet_data
+                        emoji = "CAT" if class_name == "cat" else "DOG"
+                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), COLOR_PET, 2)
+                        cv2.putText(display_frame, f"{emoji} {class_name.capitalize()} ID:{track_id}", (x, y - 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_PET, 2)
+                    
+                    if should_process_detection and self.photo_manager is not None:
+                        current_time = datetime.now()
+                        current_pet_tracks = set()
+                        
+                        for pet_data in self.last_pets_detected:
+                            x, y, w, h, class_name, track_id, mask = pet_data
+                            current_pet_tracks.add(track_id)
+                            
+                            if self.photo_manager.should_save_pet(pet_data, current_time):
+                                self.photo_manager.add_candidate_frame(
+                                    track_id, frame, pet_data, current_time, is_human=False
+                                )
+                            elif track_id in self.photo_manager.pet_track_candidates:
+                                num_candidates = len(self.photo_manager.pet_track_candidates[track_id])
+                                if num_candidates < CANDIDATE_COLLECTION_FRAMES:
+                                    self.photo_manager.add_candidate_frame(
+                                        track_id, frame, pet_data, current_time, is_human=False
+                                    )
+                                elif num_candidates == CANDIDATE_COLLECTION_FRAMES:
+                                    filepath = self.photo_manager.save_pet_photo(frame, pet_data, current_time)
+                                    if filepath:
+                                        filename = os.path.basename(filepath)
+                                        emoji = "CAT" if class_name == "cat" else "DOG"
+                                        self.log_info(f"{emoji} Saved: {filename}")
+                        
+                        lost_pet_tracks = self.previous_pet_tracks - current_pet_tracks
+                        for lost_track_id in lost_pet_tracks:
+                            if lost_track_id in self.photo_manager.pet_track_candidates:
+                                best_candidate = self.photo_manager.pet_track_candidates[lost_track_id][0]
+                                filepath = self.photo_manager.save_pet_photo(
+                                    frame, best_candidate['detection_tuple'], current_time
+                                )
+                                if filepath:
+                                    filename = os.path.basename(filepath)
+                                    self.log_info(f"PET Saved: {filename}")
+                        
+                        self.previous_pet_tracks = current_pet_tracks
+            elif not detection_active:
+                cv2.putText(display_frame, "Detection Disabled (Outside Hours)", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Resize for display
+            display_frame = resize_frame(display_frame, DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT)
+            
+            # Convert to PhotoImage
+            image = Image.fromarray(display_frame)
+            photo = ImageTk.PhotoImage(image=image)
+            
+            # Update GUI in main thread
+            self.root.after(0, self.update_display, photo)
+            
+            time.sleep(0.033)  # ~30 FPS
+    
+    def update_display(self, photo):
+        """Update the video display (called from main thread)"""
+        self.video_label.config(image=photo, text="")
+        self.video_label.image = photo
+    
+    def on_closing(self):
+        """Handle window closing"""
+        self.stop_detection()
+        self.root.destroy()

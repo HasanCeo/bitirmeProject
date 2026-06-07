@@ -1,0 +1,53 @@
+"""Application constants"""
+
+# Detection classes
+COCO_CLASS_PERSON = 0
+COCO_CLASS_CAR = 2
+COCO_CLASS_MOTORCYCLE = 3
+COCO_CLASS_BUS = 5
+COCO_CLASS_TRUCK = 7
+COCO_CLASS_CAT = 15
+COCO_CLASS_DOG = 16
+
+# Vehicle class names mapping
+VEHICLE_CLASS_NAMES = {
+    COCO_CLASS_CAR: "car",
+    COCO_CLASS_MOTORCYCLE: "motorcycle",
+    COCO_CLASS_BUS: "bus",
+    COCO_CLASS_TRUCK: "truck"
+}
+
+# Pet class names mapping
+PET_CLASS_NAMES = {
+    COCO_CLASS_CAT: "cat",
+    COCO_CLASS_DOG: "dog"
+}
+
+# Detection colors (BGR format for OpenCV)
+COLOR_HUMAN = (0, 255, 0)  # Green
+COLOR_FIRE = (0, 0, 255)  # Red
+COLOR_VEHICLE = (0, 165, 255)  # Orange
+COLOR_PET = (128, 0, 128)  # Purple
+
+# Frame processing
+DEFAULT_FRAME_SKIP_INTERVAL = 2
+DEFAULT_DISPLAY_WIDTH = 640
+DEFAULT_DISPLAY_HEIGHT = 480
+
+# Quality scoring weights
+QUALITY_SIZE_WEIGHT = 30
+QUALITY_BLUR_WEIGHT = 40
+QUALITY_CENTER_WEIGHT = 20
+QUALITY_ASPECT_WEIGHT = 10
+
+# Candidate collection
+MAX_CANDIDATES_PER_TRACK = 10
+CANDIDATE_COLLECTION_FRAMES = 15
+MIN_CANDIDATES_FOR_SAVE = 3
+
+# Save intervals
+MIN_SAVE_INTERVAL_SECONDS = 60
+
+# Alert cooldown
+ALERT_COOLDOWN_SECONDS = 30
+MAX_ALERT_HISTORY = 50

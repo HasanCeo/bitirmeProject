@@ -1,0 +1,65 @@
+{
+  "metadata_version": "1.0",
+  "images": [
+    {
+      "filename": "car_20260206_171133_id16.jpg",
+      "filepath": "/Users/ihsankirhan/Desktop/bitirmeyeni/data/detected_cars/car_20260206_171133_id16.jpg",
+      "object_type": "car",
+      "track_id": 16,
+      "colors": [
+        "gray"
+      ],
+      "detected_items": [],
+      "timestamp": "2026-02-06T17:11:33.393237",
+      "hour": 17,
+      "bbox": [
+        265,
+        177,
+        151,
+        103
+      ],
+      "confidence": 0.85,
+      "quality_score": 73.94303385416667
+    },
+    {
+      "filename": "car_20260206_171134_id33.jpg",
+      "filepath": "/Users/ihsankirhan/Desktop/bitirmeyeni/data/detected_cars/car_20260206_171134_id33.jpg",
+      "object_type": "car",
+      "track_id": 33,
+      "colors": [
+        "dark_gray"
+      ],
+      "detected_items": [],
+      "timestamp": "2026-02-06T17:11:34.662383",
+      "hour": 17,
+      "bbox": [
+        0,
+        121,
+        27,
+        46
+      ],
+      "confidence": 0.85,
+      "quality_score": 56.826171875
+    },
+    {
+      "filename": "car_20260206_171135_id49.jpg",
+      "filepath": "/Users/ihsankirhan/Desktop/bitirmeyeni/data/detected_cars/car_20260206_171135_id49.jpg",
+      "object_type": "car",
+      "track_id": 49,
+      "colors": [
+        "dark_gray"
+      ],
+      "detected_items": [],
+      "timestamp": "2026-02-06T17:11:35.362501",
+      "hour": 17,
+      "bbox": [
+        0,
+        155,
+        51,
+        61
+      ],
+      "confidence": 0.85,
+      "quality_score": 59.538736979166664
+    }
+  ]
+}

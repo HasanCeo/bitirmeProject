@@ -1,0 +1,61 @@
+{
+  "metadata_version": "1.0",
+  "images": [
+    {
+      "filename": "human_20260206_171135_id41.jpg",
+      "filepath": "/Users/ihsankirhan/Desktop/bitirmeyeni/data/detected_humans/human_20260206_171135_id41.jpg",
+      "object_type": "human",
+      "track_id": 41,
+      "upper_clothing": {
+        "type": "shirt",
+        "color": "dark_gray"
+      },
+      "lower_clothing": {
+        "type": "pants",
+        "color": "dark_gray"
+      },
+      "colors": [
+        "dark_gray"
+      ],
+      "detected_items": [],
+      "timestamp": "2026-02-06T17:11:35.362333",
+      "hour": 17,
+      "bbox": [
+        342,
+        227,
+        37,
+        70
+      ],
+      "confidence": 0.8,
+      "quality_score": 68.66080729166667
+    },
+    {
+      "filename": "human_20260206_171136_id52.jpg",
+      "filepath": "/Users/ihsankirhan/Desktop/bitirmeyeni/data/detected_humans/human_20260206_171136_id52.jpg",
+      "object_type": "human",
+      "track_id": 52,
+      "upper_clothing": {
+        "type": "shirt",
+        "color": "dark_gray"
+      },
+      "lower_clothing": {
+        "type": "pants",
+        "color": "dark_gray"
+      },
+      "colors": [
+        "dark_gray"
+      ],
+      "detected_items": [],
+      "timestamp": "2026-02-06T17:11:36.493530",
+      "hour": 17,
+      "bbox": [
+        310,
+        221,
+        24,
+        47
+      ],
+      "confidence": 0.8,
+      "quality_score": 70.1171875
+    }
+  ]
+}
