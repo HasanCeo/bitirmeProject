@@ -50,3 +50,13 @@ ESP32_CAM_CAPTURE_URL = f"http://{ESP32_CAM_IP}:{ESP32_CAM_HTTP_PORT}/capture"
 ESP32_CAM_STATUS_URL = f"http://{ESP32_CAM_IP}:{ESP32_CAM_HTTP_PORT}/status"
 ESP32_CAM_RECONNECT_DELAY = 3                  # Bağlantı koparsa yeniden deneme süresi (saniye)
 ESP32_CAM_TIMEOUT = 10                         # HTTP bağlantı zaman aşımı (saniye)
+
+# Telegram Bildirim Ayarları
+# Bot token'i BotFather'dan, chat_id'yi @userinfobot'tan alabilirsiniz.
+# Güvenlik için tercihen ortam değişkeni (environment variable) ile verin;
+# yoksa aşağıdaki tırnaklar arasına doğrudan yazabilirsiniz.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TIMEOUT = 10                           # Telegram isteği zaman aşımı (saniye)
+# Token ve chat_id dolu ise bildirim otomatik olarak aktif olur.
+TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)

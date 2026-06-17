@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from src.utils.file_utils import load_json, save_json
 from src.config.settings import BLACKLIST_FILE
 from src.config.constants import ALERT_COOLDOWN_SECONDS, MAX_ALERT_HISTORY
+from src.core.notifier import TelegramNotifier
 
 
 class BlacklistManager:
@@ -20,6 +21,7 @@ class BlacklistManager:
         self.blacklist: List[Dict[str, Any]] = []
         self.blacklist_alerts: List[Dict[str, Any]] = []
         self.alert_cooldown = ALERT_COOLDOWN_SECONDS
+        self.notifier = TelegramNotifier()
         self.load_blacklist()
     
     def load_blacklist(self):
@@ -152,7 +154,24 @@ class BlacklistManager:
             'time': datetime.now(),
             'filepath': filepath
         })
-        
+
         # Keep only last N alerts
         if len(self.blacklist_alerts) > MAX_ALERT_HISTORY:
             self.blacklist_alerts = self.blacklist_alerts[-MAX_ALERT_HISTORY:]
+
+        # Telefona anlık bildirim gönder (Telegram)
+        self._send_notification(entry, filepath)
+
+    def _send_notification(self, entry: Dict[str, Any], filepath: str):
+        """Eşleşen blacklist kaydı için telefona bildirim gönderir."""
+        object_type = entry.get('object_type', 'nesne')
+        description = entry.get('description') or entry.get('query', '')
+        timestamp = datetime.now().strftime('%d.%m.%Y %H:%M:%S')
+        message = (
+            "🚨 GÜVENLİK UYARISI\n"
+            f"Blacklist eşleşmesi tespit edildi!\n\n"
+            f"Tür: {object_type}\n"
+            f"Tanım: {description}\n"
+            f"Zaman: {timestamp}"
+        )
+        self.notifier.send_alert(message, filepath)

@@ -56,6 +56,120 @@
       ],
       "confidence": 0.8,
       "quality_score": 70.1171875
+    },
+    {
+      "filename": "human_20260616_192747_id1.jpg",
+      "filepath": "c:\\Users\\Monster\\Desktop\\bitirmeIhsan\\bitirmeyeni\\data\\detected_humans\\human_20260616_192747_id1.jpg",
+      "object_type": "human",
+      "track_id": 1,
+      "upper_clothing": {
+        "type": "shirt",
+        "color": "gray"
+      },
+      "lower_clothing": {
+        "type": "pants",
+        "color": "gray"
+      },
+      "colors": [
+        "gray"
+      ],
+      "detected_items": [],
+      "timestamp": "2026-06-16T19:27:47.073717",
+      "hour": 19,
+      "bbox": [
+        359,
+        20,
+        188,
+        358
+      ],
+      "confidence": 0.8,
+      "quality_score": 87.70206404320987
+    },
+    {
+      "filename": "human_20260616_192756_id4.jpg",
+      "filepath": "c:\\Users\\Monster\\Desktop\\bitirmeIhsan\\bitirmeyeni\\data\\detected_humans\\human_20260616_192756_id4.jpg",
+      "object_type": "human",
+      "track_id": 4,
+      "upper_clothing": {
+        "type": "shirt",
+        "color": "white"
+      },
+      "lower_clothing": {
+        "type": "pants",
+        "color": "orange"
+      },
+      "colors": [
+        "white",
+        "orange"
+      ],
+      "detected_items": [],
+      "timestamp": "2026-06-16T19:27:56.360660",
+      "hour": 19,
+      "bbox": [
+        325,
+        62,
+        217,
+        341
+      ],
+      "confidence": 0.8,
+      "quality_score": 90.25034963348766
+    },
+    {
+      "filename": "human_20260616_215802_id1.jpg",
+      "filepath": "c:\\Users\\Monster\\Desktop\\bitirmeIhsan\\bitirmeyeni\\data\\detected_humans\\human_20260616_215802_id1.jpg",
+      "object_type": "human",
+      "track_id": 1,
+      "upper_clothing": {
+        "type": "shirt",
+        "color": "gray"
+      },
+      "lower_clothing": {
+        "type": "pants",
+        "color": "gray"
+      },
+      "colors": [
+        "gray"
+      ],
+      "detected_items": [],
+      "timestamp": "2026-06-16T21:58:02.008684",
+      "hour": 21,
+      "bbox": [
+        359,
+        20,
+        188,
+        358
+      ],
+      "confidence": 0.8,
+      "quality_score": 87.70206404320987
+    },
+    {
+      "filename": "human_20260616_215812_id4.jpg",
+      "filepath": "c:\\Users\\Monster\\Desktop\\bitirmeIhsan\\bitirmeyeni\\data\\detected_humans\\human_20260616_215812_id4.jpg",
+      "object_type": "human",
+      "track_id": 4,
+      "upper_clothing": {
+        "type": "shirt",
+        "color": "white"
+      },
+      "lower_clothing": {
+        "type": "pants",
+        "color": "black"
+      },
+      "colors": [
+        "white",
+        "black"
+      ],
+      "detected_items": [],
+      "timestamp": "2026-06-16T21:58:12.028026",
+      "hour": 21,
+      "bbox": [
+        325,
+        62,
+        217,
+        341
+      ],
+      "confidence": 0.8,
+      "quality_score": 90.25034963348766
     }
   ]
 }

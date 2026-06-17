@@ -74,6 +74,11 @@ class FireDetector(BaseDetector):
             _, brightness_mask = cv2.threshold(gray, 100, 220, cv2.THRESH_BINARY)
             fire_mask = cv2.bitwise_and(fire_mask, brightness_mask)
 
+            # Kare boyutu değiştiyse (örn. webcam'den videoya geçiş) eski
+            # maskeler farklı boyutta olur; absdiff hata verir. Geçmişi temizle.
+            if self.mask_history and self.mask_history[-1].shape != fire_mask.shape:
+                self.mask_history = []
+
             # Flicker detection: fire changes over time, lamps are static
             if detect_flicker and len(self.mask_history) >= 3:
                 flicker_mask = np.zeros_like(fire_mask)

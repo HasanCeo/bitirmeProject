@@ -296,88 +296,95 @@ class HumanImageAnalyzer:
 
         return best_color
 
-    def extract_dominant_color_accurate(self, image, bbox, mask):
+    def _skin_mask(self, roi_bgr):
         """
-        Most accurate color detection using K-means clustering and HSV analysis
+        Detect skin pixels in a BGR ROI using a lighting-robust YCrCb range.
+        Returns a uint8 mask (255 = skin). Used to exclude face/arms/legs so the
+        dominant remaining color is the clothing, not the person's skin.
+        """
+        ycrcb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2YCrCb)
+        lower = np.array([0, 133, 77], dtype=np.uint8)
+        upper = np.array([255, 173, 127], dtype=np.uint8)
+        return cv2.inRange(ycrcb, lower, upper)
+
+    def extract_dominant_color_accurate(self, image, bbox, full_mask, remove_skin=True):
+        """
+        Accurate dominant-color detection using K-means + HSV, with optional
+        skin removal (used for human clothing, disabled for vehicles/pets so a
+        red car is not partially filtered as skin).
+
         Args:
-            image: Input frame (BGR)
-            bbox: Bounding box (x, y, w, h)
-            mask: Segmentation mask from YOLOv8-seg
+            image: Full input frame (BGR)
+            bbox: Sub-region (x, y, w, h) in full-frame coordinates (e.g. torso)
+            full_mask: RAW YOLOv8-seg object mask (or None)
+            remove_skin: If True, exclude skin pixels before clustering
         Returns: (color_name, rgb_tuple)
         """
         try:
             x, y, w, h = bbox
+            # Clamp the sub-region to the frame
+            x = max(0, int(x)); y = max(0, int(y))
+            w = max(1, min(int(w), image.shape[1] - x))
+            h = max(1, min(int(h), image.shape[0] - y))
             roi = image[y : y + h, x : x + w]
+            if roi.size == 0:
+                return "gray", (128, 128, 128)
 
-            # 1. APPLY MASK (NO background pixels!)
-            if mask is not None:
-                mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]))
-                mask_roi = mask_resized[y : y + h, x : x + w]
-                mask_binary = (mask_roi > 0.5).astype(np.uint8)
-
-                # Get ONLY masked pixels (no background!)
-                masked_pixels = roi[mask_binary > 0]
-
-                # If not enough pixels, use fallback
-                if len(masked_pixels) < 100:
-                    return self._fallback_color_detection(roi)
-
-                pixels = masked_pixels
+            # 1. PERSON MASK for this sub-region (no background pixels)
+            if full_mask is not None:
+                m = cv2.resize(full_mask, (image.shape[1], image.shape[0]))
+                person = (m[y : y + h, x : x + w] > 0.5).astype(np.uint8)
             else:
-                # No mask - use all pixels
-                pixels = roi.reshape(-1, 3)
+                person = np.ones(roi.shape[:2], dtype=np.uint8)
 
-            # 2. FILTER OUT VERY DARK AND VERY BRIGHT PIXELS
-            # Convert to HSV to get brightness (V channel)
-            hsv_pixels = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV)
-            hsv_pixels = hsv_pixels.reshape(-1, 3)
+            # 2. REMOVE SKIN so clothing dominates the clustering (humans only)
+            if remove_skin:
+                skin = self._skin_mask(roi)
+                clothing = person.copy()
+                clothing[skin > 0] = 0
+                pixels = roi[clothing > 0]
+            else:
+                pixels = roi[person > 0]
 
-            # Filter: V > 30 (not too dark) and V < 240 (not too bright)
+            # If skin removal left too little (bare skin / shorts / tiny crop),
+            # fall back to all person pixels rather than guessing on noise.
+            if len(pixels) < 80:
+                pixels = roi[person > 0]
+            if len(pixels) < 30:
+                return self._fallback_color_detection(roi)
+
+            # 3. Drop ONLY blown-out specular highlights (near-255). We must KEEP
+            # dark pixels: black clothing's signal lives at low brightness, so the
+            # old "remove very dark" filter turned black garments white (the few
+            # bright folds/reflections were all that survived). Letting K-means
+            # vote over all remaining pixels makes the true majority color win.
+            hsv_pixels = cv2.cvtColor(
+                pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV
+            ).reshape(-1, 3)
             brightness = hsv_pixels[:, 2]
-            valid_mask = (brightness > 30) & (brightness < 240)
+            valid = brightness < 250
+            filtered = pixels[valid] if np.sum(valid) >= 50 else pixels
 
-            if np.sum(valid_mask) < 50:
-                # Too few valid pixels - use all
-                filtered_pixels = pixels
-            else:
-                filtered_pixels = pixels[valid_mask]
-
-            # 3. K-MEANS CLUSTERING (find k=5 dominant colors)
-            filtered_pixels_float = filtered_pixels.astype(float)
-
-            # Apply K-means
-            n_clusters = min(5, len(filtered_pixels_float))
+            # 4. K-MEANS — dominant remaining (clothing) color.
+            # Cap clusters by the number of DISTINCT colors to avoid sklearn's
+            # ConvergenceWarning (and degenerate fits) on near-uniform regions.
+            data = filtered.astype(np.float32)
+            n_unique = len(np.unique(data, axis=0))
+            n_clusters = max(1, min(4, n_unique))
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            kmeans.fit(filtered_pixels_float)
+            labels = kmeans.fit_predict(data)
+            dominant_label = Counter(labels).most_common(1)[0][0]
+            dominant_bgr = kmeans.cluster_centers_[dominant_label].astype(int)
 
-            # Get cluster labels
-            labels = kmeans.labels_
-
-            # Count pixels in each cluster
-            label_counts = Counter(labels)
-
-            # Find the most common cluster (dominant color)
-            dominant_label = label_counts.most_common(1)[0][0]
-
-            # Get the center color of dominant cluster
-            dominant_color_bgr = kmeans.cluster_centers_[dominant_label].astype(int)
-
-            # 4. CONVERT TO RGB
-            dominant_color_rgb = cv2.cvtColor(
-                np.uint8([[dominant_color_bgr]]), cv2.COLOR_BGR2RGB
+            # 5. Convert + classify
+            dominant_rgb = cv2.cvtColor(
+                np.uint8([[dominant_bgr]]), cv2.COLOR_BGR2RGB
             )[0][0]
+            hsv = cv2.cvtColor(np.uint8([[dominant_bgr]]), cv2.COLOR_BGR2HSV)[0][0]
+            rgb_tuple = tuple(int(c) for c in dominant_rgb)
+            color_name = self._classify_color_from_hsv(hsv[0], hsv[1], hsv[2], rgb_tuple)
 
-            # 5. CONVERT TO HSV for classification
-            dominant_hsv = cv2.cvtColor(
-                np.uint8([[dominant_color_bgr]]), cv2.COLOR_BGR2HSV
-            )[0][0]
-
-            h, s, v = dominant_hsv
-
-            # 6. HSV-BASED COLOR CLASSIFICATION (most accurate)
-            color_name = self._classify_color_from_hsv(h, s, v, tuple(dominant_color_rgb))
-
-            return color_name, tuple(dominant_color_rgb)
+            return color_name, rgb_tuple
 
         except Exception as e:
             logging.error(f"K-means color detection error: {e}")
@@ -396,48 +403,48 @@ class HumanImageAnalyzer:
             rgb: RGB tuple for fallback
         Returns: color name (string)
         """
-        # First check neutral colors using saturation and value
+        # --- Neutral colors first (saturation/value driven) ---
 
         # Very dark → Black
-        if v < 50:
+        if v < 45:
             return "black"
 
-        # Very bright + low saturation → White
-        if v > 200 and s < 30:
-            return "white"
-
-        # Low saturation → Gray tones
-        if s < 30:
-            if v > 170:
+        # Low saturation → grayscale ramp
+        if s < 35:
+            if v > 195:
                 return "white"
-            elif v > 120:
+            elif v > 140:
                 return "silver"
-            elif v > 70:
+            elif v > 80:
                 return "gray"
             else:
                 return "dark_gray"
 
-        # Medium saturation + bright → Beige/Cream
-        if s < 60 and v > 150:
+        # Warm but desaturated & bright → Beige/Cream
+        if s < 60 and v > 160:
             r, g, b = rgb
-            if r > g and r > b:
+            if r >= g >= b:
                 return "beige"
 
-        # High saturation → Colorful (classify by Hue)
-        # HSV Hue in OpenCV: 0-180 scale
-        if h < 10 or h > 170:  # Red (0-10 and 170-180)
+        # Brown = warm hue (red/orange) that is dark → must be checked
+        # BEFORE the orange/red hue buckets, otherwise brown reads as orange.
+        if h < 25 and v < 130 and s > 60:
+            return "brown"
+
+        # --- Saturated colors classified by Hue (OpenCV 0-180 scale) ---
+        if h < 10 or h > 170:  # Red
             return "red"
-        elif h < 25:  # Orange (10-25)
+        elif h < 25:  # Orange
             return "orange"
-        elif h < 35:  # Yellow (25-35)
+        elif h < 35:  # Yellow
             return "yellow"
-        elif h < 85:  # Green (35-85)
+        elif h < 85:  # Green
             return "green"
-        elif h < 130:  # Blue (85-130)
+        elif h < 130:  # Blue
             return "blue"
-        elif h < 155:  # Purple (130-155)
+        elif h < 150:  # Purple
             return "purple"
-        else:  # Pink/Reddish (155-170)
+        else:  # Pink/Reddish
             return "pink"
 
     def _fallback_color_detection(self, roi):
@@ -509,39 +516,27 @@ class HumanImageAnalyzer:
                 upper_clothing = {"type": "shirt", "color": ""}
                 lower_clothing = {"type": "pants", "color": ""}
 
-                # Analyze upper body (0-60% of height)
+                # Central horizontal band: avoids arms (skin) and the background
+                # that leaks in at the left/right edges of the bbox.
+                band_x = x + int(w * 0.22)
+                band_w = max(1, int(w * 0.56))
+
+                # NOTE: the RAW person mask is passed straight through;
+                # extract_dominant_color_accurate crops it to the sub-region itself.
+
+                # Torso: skip the head (top ~15%) and stop at the waist (~50%)
                 try:
-                    upper_bbox = (x, y, w, int(h * 0.6))
-
-                    # Create upper mask if mask is provided
-                    upper_mask = None
-                    if mask is not None:
-                        mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]))
-                        upper_mask_roi = mask_resized[y : y + int(h * 0.6), x : x + w]
-                        upper_mask = upper_mask_roi
-
-                    # Use K-means + HSV for accurate color detection
-                    color_name, rgb = self.extract_dominant_color_accurate(image, upper_bbox, upper_mask)
+                    torso_bbox = (band_x, y + int(h * 0.15), band_w, int(h * 0.35))
+                    color_name, rgb = self.extract_dominant_color_accurate(image, torso_bbox, mask)
                     upper_clothing["color"] = color_name
                     logging.debug(f"Upper clothing: {color_name} RGB: {rgb}")
                 except Exception as e:
                     logging.debug(f"Error analyzing upper region: {e}")
 
-                # Analyze lower body (40-100% of height)
+                # Legs: start below the waist (~55%) and skip the feet/shoes (~10%)
                 try:
-                    lower_y = y + int(h * 0.4)
-                    lower_h = h - int(h * 0.4)
-                    lower_bbox = (x, lower_y, w, lower_h)
-
-                    # Create lower mask if mask is provided
-                    lower_mask = None
-                    if mask is not None:
-                        mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]))
-                        lower_mask_roi = mask_resized[lower_y : y + h, x : x + w]
-                        lower_mask = lower_mask_roi
-
-                    # Use K-means + HSV for accurate color detection
-                    color_name, rgb = self.extract_dominant_color_accurate(image, lower_bbox, lower_mask)
+                    legs_bbox = (band_x, y + int(h * 0.55), band_w, int(h * 0.33))
+                    color_name, rgb = self.extract_dominant_color_accurate(image, legs_bbox, mask)
                     lower_clothing["color"] = color_name
                     logging.debug(f"Lower clothing: {color_name} RGB: {rgb}")
                 except Exception as e:
@@ -562,8 +557,10 @@ class HumanImageAnalyzer:
                     return {"colors": ["gray"], "detected_items": []}
 
                 try:
-                    # Use K-means + HSV for accurate color detection
-                    color_name, rgb = self.extract_dominant_color_accurate(image, bbox, mask)
+                    # Vehicles/pets: keep all object pixels (no skin removal)
+                    color_name, rgb = self.extract_dominant_color_accurate(
+                        image, bbox, mask, remove_skin=False
+                    )
                     colors.append(color_name)
                     logging.debug(f"Vehicle/Pet color detected: {color_name} RGB: {rgb}")
                 except Exception as e:
@@ -588,4 +585,38 @@ class HumanImageAnalyzer:
                 }
             else:
                 return {"colors": [], "detected_items": []}
+
+    def vote_clothing_colors(self, candidates, max_frames=5):
+        """
+        Temporal voting: estimate clothing colors across several candidate frames
+        of the SAME person and return the majority color per region. This is far
+        more robust than a single frame (motion blur / lighting can flip one frame).
+
+        Args:
+            candidates: list of dicts with keys 'frame' and 'detection_tuple'
+                        where detection_tuple = (x, y, w, h, track_id, mask)
+            max_frames: how many candidate frames to sample
+        Returns: dict {'upper': color_or_None, 'lower': color_or_None}
+        """
+        uppers, lowers = [], []
+        for cand in candidates[:max_frames]:
+            try:
+                frame = cand["frame"]
+                x, y, w, h, _track_id, mask = cand["detection_tuple"]
+                md = self.extract_metadata(
+                    frame, object_type="human", bbox=(x, y, w, h), mask=mask
+                )
+                u = md.get("upper_clothing", {}).get("color")
+                l = md.get("lower_clothing", {}).get("color")
+                if u:
+                    uppers.append(u)
+                if l:
+                    lowers.append(l)
+            except Exception as e:
+                logging.debug(f"vote_clothing_colors frame skipped: {e}")
+                continue
+
+        upper = Counter(uppers).most_common(1)[0][0] if uppers else None
+        lower = Counter(lowers).most_common(1)[0][0] if lowers else None
+        return {"upper": upper, "lower": lower}
 

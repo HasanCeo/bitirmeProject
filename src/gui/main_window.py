@@ -39,17 +39,26 @@ class WebcamMonitor:
         """Initialize the application"""
         self.root = root
         self.root.title("Security Camera - Human & Fire Detection System")
-        self.root.geometry("1000x900")
-        self.root.configure(bg='#f0f0f0')
-        
-        # Configure modern style
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('Title.TLabel', font=('Segoe UI', 12, 'bold'), background='#f0f0f0')
-        style.configure('Heading.TLabel', font=('Segoe UI', 10, 'bold'), background='#f0f0f0')
-        style.configure('Status.TLabel', font=('Segoe UI', 9), background='#f0f0f0')
-        style.configure('Action.TButton', font=('Segoe UI', 9, 'bold'))
-        style.configure('Primary.TButton', font=('Segoe UI', 9))
+        self.root.geometry("1180x920")
+        self.root.minsize(1000, 760)
+
+        # Merkezi renk paleti (Koyu Dashboard teması).
+        # Tüm arayüz renkleri buradan türetilir; tek yerden değiştirilebilir.
+        self.colors = {
+            'bg':       '#0f172a',  # uygulama zemini (koyu lacivert)
+            'card':     '#1e293b',  # paneller (slate)
+            'card_alt': '#273449',  # girişler / iç yüzeyler
+            'border':   '#334155',  # kenarlıklar
+            'accent':   '#06b6d4',  # ana vurgu (cyan)
+            'accent2':  '#3b82f6',  # ikincil vurgu (mavi)
+            'text':     '#e2e8f0',  # ana metin
+            'muted':    '#94a3b8',  # ikincil metin
+            'success':  '#22c55e',  # çalışıyor
+            'danger':   '#ef4444',  # hata / durdu
+            'warning':  '#f59e0b',  # uyarı / bekliyor
+        }
+        self.root.configure(bg=self.colors['bg'])
+        self._setup_styles()
         
         # Detection state
         self.detection_enabled = True
@@ -131,32 +140,113 @@ class WebcamMonitor:
         # Start camera automatically
         self.root.after(100, self.start_detection)
     
+    def _setup_styles(self):
+        """Tüm ttk widget'ları için Koyu Dashboard stillerini yapılandırır."""
+        c = self.colors
+        style = ttk.Style()
+        style.theme_use('clam')
+
+        base = ('Segoe UI', 10)
+
+        # Çerçeveler
+        style.configure('TFrame', background=c['card'])
+        style.configure('Bg.TFrame', background=c['bg'])
+
+        # Kart paneller (LabelFrame)
+        style.configure('TLabelframe', background=c['card'], bordercolor=c['border'],
+                        relief='solid', borderwidth=1)
+        style.configure('TLabelframe.Label', background=c['bg'], foreground=c['accent'],
+                        font=('Segoe UI', 10, 'bold'))
+
+        # Etiketler
+        style.configure('TLabel', background=c['card'], foreground=c['text'], font=base)
+        style.configure('Title.TLabel', background=c['bg'], foreground=c['text'],
+                        font=('Segoe UI', 17, 'bold'))
+        style.configure('Subtitle.TLabel', background=c['bg'], foreground=c['muted'],
+                        font=('Segoe UI', 10))
+        style.configure('Heading.TLabel', background=c['card'], foreground=c['text'],
+                        font=('Segoe UI', 10, 'bold'))
+        style.configure('Status.TLabel', background=c['card'], foreground=c['muted'],
+                        font=('Segoe UI', 9))
+
+        # Butonlar
+        style.configure('TButton', background=c['card_alt'], foreground=c['text'],
+                        font=('Segoe UI', 9), borderwidth=0, padding=(10, 6))
+        style.map('TButton', background=[('active', c['border']), ('pressed', c['border'])],
+                  foreground=[('active', c['text'])])
+
+        style.configure('Primary.TButton', background=c['accent2'], foreground='#ffffff',
+                        font=('Segoe UI', 9, 'bold'), borderwidth=0, padding=(10, 7))
+        style.map('Primary.TButton',
+                  background=[('active', c['accent']), ('pressed', c['accent'])])
+
+        style.configure('Action.TButton', background=c['accent'], foreground='#06283d',
+                        font=('Segoe UI', 9, 'bold'), borderwidth=0, padding=(12, 6))
+        style.map('Action.TButton',
+                  background=[('active', c['accent2']), ('pressed', c['accent2'])],
+                  foreground=[('active', '#ffffff')])
+
+        # Onay kutuları
+        style.configure('TCheckbutton', background=c['card'], foreground=c['text'], font=base)
+        style.map('TCheckbutton', background=[('active', c['card'])],
+                  indicatorcolor=[('selected', c['accent']), ('!selected', c['card_alt'])],
+                  foreground=[('active', c['text'])])
+
+        # Giriş alanları
+        style.configure('TEntry', fieldbackground=c['card_alt'], foreground=c['text'],
+                        bordercolor=c['border'], insertcolor=c['text'],
+                        borderwidth=1, padding=4)
+        style.configure('TSpinbox', fieldbackground=c['card_alt'], foreground=c['text'],
+                        background=c['card_alt'], bordercolor=c['border'],
+                        arrowcolor=c['text'], insertcolor=c['text'], borderwidth=1, padding=3)
+        style.configure('TCombobox', fieldbackground=c['card_alt'], background=c['card_alt'],
+                        foreground=c['text'], bordercolor=c['border'], arrowcolor=c['text'],
+                        borderwidth=1, padding=3)
+        style.map('TCombobox', fieldbackground=[('readonly', c['card_alt'])],
+                  foreground=[('readonly', c['text'])],
+                  selectbackground=[('readonly', c['card_alt'])],
+                  selectforeground=[('readonly', c['text'])])
+
+        # Combobox açılır listesi (option database ile)
+        self.root.option_add('*TCombobox*Listbox.background', c['card_alt'])
+        self.root.option_add('*TCombobox*Listbox.foreground', c['text'])
+        self.root.option_add('*TCombobox*Listbox.selectBackground', c['accent2'])
+        self.root.option_add('*TCombobox*Listbox.selectForeground', '#ffffff')
+
+        # Kaydırma çubukları
+        style.configure('TScrollbar', background=c['card_alt'], troughcolor=c['card'],
+                        bordercolor=c['card'], arrowcolor=c['muted'])
+        style.map('TScrollbar', background=[('active', c['border'])])
+
     def setup_gui(self):
         """Setup the GUI components"""
         # Main frame
-        main_frame = ttk.Frame(self.root, padding="15")
+        main_frame = ttk.Frame(self.root, padding="15", style='Bg.TFrame')
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Title
-        title_label = ttk.Label(main_frame, text="📹 Security Camera Monitoring System", 
-                               style='Title.TLabel')
-        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 15), sticky="w")
-        
+        # Title / header
+        header = ttk.Frame(main_frame, style='Bg.TFrame')
+        header.grid(row=0, column=0, columnspan=2, pady=(0, 16), sticky="w")
+        ttk.Label(header, text="📹  Security Camera Monitoring System",
+                  style='Title.TLabel').grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Gerçek zamanlı tespit · Blacklist uyarıları · Telegram bildirimleri",
+                  style='Subtitle.TLabel').grid(row=1, column=0, sticky="w", pady=(2, 0))
+
         # Left column frame
-        left_frame = ttk.Frame(main_frame)
-        left_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
-        
+        left_frame = ttk.Frame(main_frame, style='Bg.TFrame')
+        left_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 12))
+
         # Right column frame
-        right_frame = ttk.Frame(main_frame)
+        right_frame = ttk.Frame(main_frame, style='Bg.TFrame')
         right_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Video display
         video_frame = ttk.LabelFrame(left_frame, text="  📷 Camera View  ", padding="8")
         video_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
-        self.video_label = tk.Label(video_frame, text="Initializing camera...", 
-                                    bg="#1a1a1a", fg="#ffffff", 
-                                    font=('Segoe UI', 10))
+        self.video_label = tk.Label(video_frame, text="Kamera başlatılıyor...",
+                                    bg="#0a0f1a", fg=self.colors['accent'],
+                                    font=('Segoe UI', 11))
         self.video_label.pack(fill=tk.BOTH, expand=True)
         
         # Control panel
@@ -167,8 +257,8 @@ class WebcamMonitor:
         status_container = ttk.Frame(control_frame)
         status_container.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         ttk.Label(status_container, text="Status:", style='Heading.TLabel').grid(row=0, column=0, padx=(0, 10))
-        self.status_label = ttk.Label(status_container, text="Starting...", 
-                                      foreground="#ff8c00", style='Status.TLabel')
+        self.status_label = ttk.Label(status_container, text="● Başlatılıyor...",
+                                      foreground=self.colors['warning'], style='Status.TLabel')
         self.status_label.grid(row=0, column=1, sticky="w")
         
         # Detection toggles
@@ -244,8 +334,9 @@ class WebcamMonitor:
         results_frame = ttk.LabelFrame(right_frame, text="  📋 Search Results  ", padding="10")
         results_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
-        self.results_canvas = tk.Canvas(results_frame, height=220, bg='white', highlightthickness=1, 
-                                       highlightbackground='#d0d0d0')
+        self.results_canvas = tk.Canvas(results_frame, height=220, bg=self.colors['card'],
+                                       highlightthickness=1,
+                                       highlightbackground=self.colors['border'])
         results_scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.results_canvas.yview)
         self.results_scrollable_frame = ttk.Frame(self.results_canvas)
         
@@ -283,7 +374,13 @@ class WebcamMonitor:
         list_frame.pack(fill=tk.BOTH, expand=True)
         
         self.blacklist_listbox = tk.Listbox(list_frame, height=4, font=('Segoe UI', 9),
-                                            bg='#fff3cd', fg='#333333', selectmode=tk.SINGLE)
+                                            bg=self.colors['card_alt'], fg='#fca5a5',
+                                            selectbackground=self.colors['danger'],
+                                            selectforeground='#ffffff',
+                                            highlightthickness=1,
+                                            highlightbackground=self.colors['border'],
+                                            borderwidth=0, relief=tk.FLAT,
+                                            selectmode=tk.SINGLE)
         blacklist_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, 
                                            command=self.blacklist_listbox.yview)
         self.blacklist_listbox.config(yscrollcommand=blacklist_scrollbar.set)
@@ -299,13 +396,19 @@ class WebcamMonitor:
         info_frame = ttk.LabelFrame(right_frame, text="  📝 System Logs  ", padding="10")
         info_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 0))
         
-        self.info_text = tk.Text(info_frame, height=6, width=70, 
+        self.info_text = tk.Text(info_frame, height=6, width=70,
                                  font=('Consolas', 9), wrap=tk.WORD,
-                                 bg='#fafafa', fg='#333333',
-                                 relief=tk.FLAT, borderwidth=1,
-                                 highlightthickness=1, highlightbackground='#d0d0d0',
-                                 padx=8, pady=8)
+                                 bg='#0b1220', fg=self.colors['muted'],
+                                 insertbackground=self.colors['text'],
+                                 relief=tk.FLAT, borderwidth=0,
+                                 highlightthickness=1,
+                                 highlightbackground=self.colors['border'],
+                                 padx=10, pady=8)
         self.info_text.pack(fill=tk.BOTH, expand=True)
+        # Log satırları için renk etiketleri
+        self.info_text.tag_config('alert', foreground=self.colors['danger'])
+        self.info_text.tag_config('warn', foreground=self.colors['warning'])
+        self.info_text.tag_config('ok', foreground=self.colors['success'])
         scrollbar = ttk.Scrollbar(info_frame, orient=tk.VERTICAL, command=self.info_text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.info_text.config(yscrollcommand=scrollbar.set)
@@ -427,16 +530,16 @@ class WebcamMonitor:
             
             # Display results
             if not matching_images:
-                no_result_label = ttk.Label(self.results_scrollable_frame, 
+                no_result_label = ttk.Label(self.results_scrollable_frame,
                                            text=f"❌ No search results found\n\nQuery: '{query}'\nTime range: {start_hour:02d}:00 - {end_hour:02d}:59",
-                                           foreground="#666666", 
+                                           foreground=self.colors['muted'],
                                            font=('Segoe UI', 10))
                 no_result_label.grid(row=0, column=0, padx=20, pady=30, sticky="w")
             else:
-                result_label = ttk.Label(self.results_scrollable_frame, 
+                result_label = ttk.Label(self.results_scrollable_frame,
                                         text=f"✅ {len(matching_images)} match(es) found:",
                                         font=('Segoe UI', 11, 'bold'),
-                                        foreground="#2d5016")
+                                        foreground=self.colors['success'])
                 result_label.grid(row=0, column=0, columnspan=4, padx=10, pady=(10, 15), sticky="w")
                 
                 # Display images in a grid
@@ -470,9 +573,9 @@ class WebcamMonitor:
                             img_label.pack()
                             
                             info_text = f"{image_file[:25]}...\nConfidence: {confidence:.1%}"
-                            info_label = ttk.Label(img_frame, text=info_text, 
+                            info_label = ttk.Label(img_frame, text=info_text,
                                                   font=('Segoe UI', 8),
-                                                  foreground="#555555",
+                                                  foreground=self.colors['muted'],
                                                   justify=tk.CENTER)
                             info_label.pack(pady=(5, 0))
                             
@@ -513,8 +616,9 @@ class WebcamMonitor:
             self.esp32_stream.open()
             
             if not self.esp32_stream.isOpened():
-                self.status_label.config(text="Status: ESP32-CAM Error", foreground="red")
-                self.video_label.config(text="ESP32-CAM bağlantı kurulamadı", bg="black", fg="red")
+                self.status_label.config(text="● ESP32-CAM Hatası", foreground=self.colors['danger'])
+                self.video_label.config(text="ESP32-CAM bağlantı kurulamadı",
+                                        bg="#0a0f1a", fg=self.colors['danger'])
                 messagebox.showerror("Error", 
                     f"ESP32-CAM'e bağlanılamadı!\n\n"
                     f"URL: {ESP32_CAM_STREAM_URL}\n\n"
@@ -529,7 +633,7 @@ class WebcamMonitor:
             
             self.running = True
             self.video_paused = False
-            self.status_label.config(text="Status: Running (ESP32-CAM)", foreground="green")
+            self.status_label.config(text="● Çalışıyor (ESP32-CAM)", foreground=self.colors['success'])
             self.log_info(f"ESP32-CAM stream başlatıldı: {ESP32_CAM_STREAM_URL}")
             
             self.video_thread = Thread(target=self.process_video, daemon=True)
@@ -537,11 +641,20 @@ class WebcamMonitor:
             return
         
         # Webcam veya video dosyası modu (mevcut davranış)
-        self.cap = cv2.VideoCapture(self.video_source)
+        if isinstance(self.video_source, int):
+            # Windows'ta varsayılan MSMF backend'i bazı kameralarda açılamıyor;
+            # DSHOW backend'i daha güvenilir. Açılamazsa varsayılana düşeriz.
+            self.cap = cv2.VideoCapture(self.video_source, cv2.CAP_DSHOW)
+            if not self.cap.isOpened():
+                self.cap.release()
+                self.cap = cv2.VideoCapture(self.video_source)
+        else:
+            self.cap = cv2.VideoCapture(self.video_source)
         if not self.cap.isOpened():
             source_name = "video file" if isinstance(self.video_source, str) else "webcam"
-            self.status_label.config(text="Status: Camera Error", foreground="red")
-            self.video_label.config(text=f"Could not open {source_name}", bg="black", fg="red")
+            self.status_label.config(text="● Kamera Hatası", foreground=self.colors['danger'])
+            self.video_label.config(text=f"Could not open {source_name}",
+                                    bg="#0a0f1a", fg=self.colors['danger'])
             messagebox.showerror("Error", f"Could not open {source_name}.")
             return
         
@@ -560,7 +673,7 @@ class WebcamMonitor:
         self.running = True
         self.video_paused = False
         source_type = "video" if isinstance(self.video_source, str) else "camera"
-        self.status_label.config(text=f"Status: Running ({source_type})", foreground="green")
+        self.status_label.config(text=f"● Çalışıyor ({source_type})", foreground=self.colors['success'])
         self.log_info(f"Started on {source_type}")
         
         self.video_thread = Thread(target=self.process_video, daemon=True)
@@ -576,8 +689,8 @@ class WebcamMonitor:
         if self.esp32_stream:
             self.esp32_stream.release()
             self.esp32_stream = None
-        self.status_label.config(text="Status: Stopped", foreground="red")
-        self.video_label.config(image='', text="Camera stopped")
+        self.status_label.config(text="● Durdu", foreground=self.colors['danger'])
+        self.video_label.config(image='', text="Kamera durdu")
         self.log_info("Stopped")
         
         self.video_source = 0
@@ -620,8 +733,9 @@ class WebcamMonitor:
             self.stop_detection()
         
         # Önce bağlantıyı test et
-        self.status_label.config(text="Status: ESP32-CAM bağlanıyor...", foreground="orange")
-        self.video_label.config(text="ESP32-CAM'e bağlanılıyor...", bg="#1a1a1a", fg="#ffcc00")
+        self.status_label.config(text="● ESP32-CAM bağlanıyor...", foreground=self.colors['warning'])
+        self.video_label.config(text="ESP32-CAM'e bağlanılıyor...",
+                                bg="#0a0f1a", fg=self.colors['warning'])
         self.root.update_idletasks()
         
         self.video_source = "esp32cam"
@@ -632,17 +746,25 @@ class WebcamMonitor:
         """Pause/resume video playback"""
         if self.running:
             self.video_paused = not self.video_paused
-            status = "Paused" if self.video_paused else "Running"
+            status = "Duraklatıldı" if self.video_paused else "Çalışıyor"
             source_type = "video" if isinstance(self.video_source, str) else "camera"
-            self.status_label.config(text=f"Status: {status} ({source_type})", 
-                                    foreground="orange" if self.video_paused else "green")
+            self.status_label.config(text=f"● {status} ({source_type})",
+                                    foreground=self.colors['warning'] if self.video_paused else self.colors['success'])
             self.log_info(f"Video {status.lower()}")
     
     def log_info(self, message):
         """Add message to info text and log file"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] {message}"
-        self.info_text.insert(tk.END, log_message + "\n")
+        # İçeriğe göre renk etiketi seç
+        tag = None
+        if any(s in message for s in ('🚨', 'FIRE', 'Error', 'failed', 'Failed')):
+            tag = 'alert'
+        elif any(s in message for s in ('⏳', 'Warning', 'updated')):
+            tag = 'warn'
+        elif any(s in message for s in ('✅', 'ready', 'Saved', 'Started')):
+            tag = 'ok'
+        self.info_text.insert(tk.END, log_message + "\n", tag)
         self.info_text.see(tk.END)
         logging.info(message)
     
@@ -679,8 +801,12 @@ class WebcamMonitor:
                 ret, frame = self.cap.read()
                 if not ret:
                     if isinstance(self.video_source, str) and self.video_source != "esp32cam":
-                        self.log_info("Video processing completed")
-                        self.root.after(100, self.stop_detection)
+                        # Video bitti -> başa sar (loop). Böylece kısa klipler
+                        # tekrar oynar; model arka planda yüklenirken video
+                        # bitmez ve tespit sonraki turlarda çalışır.
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        self.current_frame_num = 0
+                        continue
                     break
             else:
                 time.sleep(0.1)
@@ -707,6 +833,12 @@ class WebcamMonitor:
                 self.last_cars_detected = []
                 self.last_pets_detected = []
                 
+                if motion_detected and self._yolo_detector is None:
+                    # Model henüz arka planda yükleniyor; bir kez bilgilendir.
+                    if not getattr(self, '_model_wait_warned', False):
+                        self._model_wait_warned = True
+                        self.log_info("⏳ Model henüz yükleniyor, tespit birazdan başlayacak...")
+
                 if motion_detected and self._yolo_detector is not None:
                     humans, vehicles, pets = self._yolo_detector.detect_all(frame)
                     self.last_humans_detected = humans
@@ -888,11 +1020,12 @@ class WebcamMonitor:
                 try:
                     image = Image.fromarray(display_frame)
                     photo = ImageTk.PhotoImage(image=image)
-                    
+
                     # Update GUI in main thread
                     self.root.after(0, self.update_display, photo)
-                except Exception:
+                except Exception as e:
                     # Window may have been destroyed
+                    logging.error(f"DIAG display error: {type(e).__name__}: {e}")
                     break
             
             time.sleep(0.033)  # ~30 FPS

@@ -1,0 +1,16 @@
+{
+  "entries": [
+    {
+      "query": "white",
+      "object_type": "vehicle",
+      "description": "white",
+      "added_time": "2026-06-16T19:11:05.182735"
+    },
+    {
+      "query": "white tshirt",
+      "object_type": "human",
+      "description": "white tshirt",
+      "added_time": "2026-06-16T19:22:39.071073"
+    }
+  ]
+}

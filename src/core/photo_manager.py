@@ -126,13 +126,20 @@ class PhotoManager:
         
         # Get best candidate (highest quality score)
         best_candidate = candidates_dict[track_id][0]
-        
+
         # Save the best frame
         if is_human:
+            # Temporal voting: estimate clothing colors across candidate frames
+            # (robust to single-frame motion blur / lighting), then save the best
+            # quality frame as the photo but with the voted colors as metadata.
+            color_override = self.image_analyzer.vote_clothing_colors(
+                candidates_dict[track_id]
+            )
             filepath = self.save_human_photo(
                 best_candidate['frame'],
                 best_candidate['detection_tuple'],
-                best_candidate['timestamp']
+                best_candidate['timestamp'],
+                color_override=color_override
             )
         else:
             filepath = self.save_car_photo(
@@ -186,15 +193,18 @@ class PhotoManager:
         
         return True
     
-    def save_human_photo(self, frame, detection_tuple: Tuple, timestamp: datetime) -> Optional[str]:
+    def save_human_photo(self, frame, detection_tuple: Tuple, timestamp: datetime,
+                         color_override: Optional[Dict[str, str]] = None) -> Optional[str]:
         """
         Save human photo with metadata
-        
+
         Args:
             frame: Full frame (BGR)
             detection_tuple: (x, y, w, h, track_id, mask)
             timestamp: Detection timestamp
-        
+            color_override: Optional {'upper': color, 'lower': color} from temporal
+                voting across candidate frames (overrides single-frame estimate)
+
         Returns:
             Optional[str]: Filepath if saved successfully, None otherwise
         """
@@ -221,7 +231,16 @@ class PhotoManager:
             metadata_info = self.image_analyzer.extract_metadata(
                 frame, object_type='human', bbox=bbox, mask=mask
             )
-            
+
+            # Apply temporal-voting colors if provided (more robust than 1 frame)
+            if color_override:
+                if color_override.get('upper'):
+                    metadata_info.setdefault('upper_clothing', {'type': 'shirt', 'color': ''})
+                    metadata_info['upper_clothing']['color'] = color_override['upper']
+                if color_override.get('lower'):
+                    metadata_info.setdefault('lower_clothing', {'type': 'pants', 'color': ''})
+                    metadata_info['lower_clothing']['color'] = color_override['lower']
+
             # Calculate quality score
             quality_score = calculate_frame_quality_score(frame, bbox, frame.shape)
             
