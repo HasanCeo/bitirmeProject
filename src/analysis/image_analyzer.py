@@ -399,11 +399,15 @@ class HumanImageAnalyzer:
         way a 3-D perceptual (ΔE/Lab) nearest-neighbour does. Neutrals are named
         by brightness.
         """
+        b_bgr, g_bgr, r_bgr = (int(c) for c in bgr)
         hsv = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0, 0]
         h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
-        rgb = tuple(int(c) for c in cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2RGB)[0, 0])
 
         # Neutral garment, or near-black noise -> grayscale ramp by brightness.
+        # Below V~35 saturation is pure sensor noise (S = (max-min)/max blows up
+        # at low V), so a random warm hue must NOT win there -> name by brightness.
+        # Genuinely dark colors (navy V~80, dark red V~110) sit well above this
+        # and still reach the hue buckets below.
         if not is_chromatic or v < 35:
             if v < 50:
                 return "black"
@@ -411,28 +415,40 @@ class HumanImageAnalyzer:
                 return "dark_gray"
             if v < 150:
                 return "gray"
-            if v < 205:
+            if v < 160:
                 return "silver"
             return "white"
 
         # Brown = a dark, warm (red/orange) hue — must be tested before the
-        # orange/red hue buckets, otherwise brown reads as orange.
-        if h < 25 and v < 130 and s > 60:
+        # orange/red hue buckets, otherwise brown reads as orange. Two guards
+        # keep vivid reds out: a hue floor of 8 (pure red, h<8, is red not
+        # brown) and a saturation CEILING of 175 (a vivid red shirt sits at
+        # S~220 and must stay red; real brown is muted, S~60-120).
+        if 8 <= h < 28 and v < 130 and 50 < s < 175:
             return "brown"
-        # Warm, desaturated and bright -> beige/cream.
-        if s < 60 and v > 160 and rgb[0] >= rgb[1] >= rgb[2]:
+        # Warm, desaturated and bright -> beige/cream. Channel order read from
+        # the BGR pixel directly (robust to white-balance gains shifting RGB).
+        if s < 60 and v > 160 and r_bgr >= g_bgr >= b_bgr:
             return "beige"
 
         # Saturated colors by hue (OpenCV 0-180 scale).
         if h < 10 or h > 170:
             return "red"
-        if h < 25:
+        # Orange/yellow split at 21: real orange sits at hue 17-20 (CSS
+        # darkorange=17, orange=20), while amber / gold / mustard (21-28) read
+        # as yellow, not orange.
+        if h < 21:
             return "orange"
         if h < 35:
             return "yellow"
         if h < 85:
             return "green"
         if h < 130:
+            # Dark, saturated blue -> navy. Requires strong saturation (s>90):
+            # real navy sits at S~180+, while a cool-tinted dark gray is S~50 and
+            # must NOT be called navy.
+            if h >= 100 and v < 110 and s > 90:
+                return "navy"
             return "blue"
         if h < 150:
             return "purple"
@@ -441,9 +457,11 @@ class HumanImageAnalyzer:
     def classify_color_lab(self, bgr):
         """Name a single BGR color (kept for API compatibility)."""
         s = int(cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0, 0, 1])
-        return self._name_color(bgr, s >= 40)
+        # Mirror the median-saturation gate used by dominant_color_from_pixels
+        # (med_s > 35) so a faint-tint neutral isn't named as a color here.
+        return self._name_color(bgr, s > 35)
 
-    def dominant_color_from_pixels(self, pixels, wb_gains=None):
+    def dominant_color_from_pixels(self, pixels, wb_gains=None, n_secondary=0):
         """
         Classify the dominant color of an arbitrary set of garment pixels.
 
@@ -457,7 +475,14 @@ class HumanImageAnalyzer:
             pixels: (N, 3) uint8 BGR ndarray of the garment's pixels
             wb_gains: optional (3,) BGR gains from estimate_wb_gains() applied
                 before classification (illuminant normalization)
-        Returns: (color_name, rgb_tuple) or None if too few pixels
+            n_secondary: if > 0, also extract that many SECONDARY colors (the
+                next-largest K-means clusters after the dominant) and return
+                them as a third element.
+        Returns:
+            - if n_secondary == 0: (color_name, rgb_tuple), or None if too few
+              pixels (backward-compatible 2-tuple).
+            - if n_secondary  > 0: (color_name, rgb_tuple, secondary_list),
+              where secondary_list is a list of {color, rgb, proportion} dicts.
         """
         if pixels is None or len(pixels) < 30:
             return None
@@ -479,30 +504,184 @@ class HumanImageAnalyzer:
             if int(np.sum(keep)) >= 30:
                 px, S, V = px[keep], S[keep], V[keep]
 
-            # Chromatic vs neutral decision from the saturation DISTRIBUTION (a
-            # clearly colored garment can then never be named gray/black).
-            is_chromatic = float(np.mean(S > 40)) > 0.25
+            # Chromatic vs neutral decision.
+            # The median color's OWN saturation is the robust signal: the median
+            # averages out per-pixel sensor noise, which otherwise blows up at low
+            # brightness (S = (max-min)/max) and falsely flags a noisy gray as
+            # colored. A population term (a real block of saturated pixels) is
+            # OR-ed in so a colored garment with a desaturated median (heavy
+            # shadow/highlight mix) is still caught.
+            med_all = np.median(px.astype(np.float32), axis=0)
+            med_hsv = cv2.cvtColor(np.uint8([[med_all]]), cv2.COLOR_BGR2HSV)[0, 0]
+            med_h, med_s = int(med_hsv[0]), int(med_hsv[1])
+            # HUE-AWARE saturation gate. A weak BLUE/cool tint is the single most
+            # common neutral cast (cool light, blue-ish shadows on gray fabric),
+            # so a cool hue needs MORE saturation to be judged a real color —
+            # otherwise gray shoes read as navy. A pale PINK/magenta tint almost
+            # never comes from lighting, so a faint one IS a real (pastel) color
+            # — otherwise a light-pink shirt reads as silver.
+            if 85 <= med_h <= 145:        # blue / cool zone
+                sat_gate = 60
+            elif med_h >= 150:            # pink / magenta
+                sat_gate = 22
+            else:                         # warm / green
+                sat_gate = 35
+            # Population backstop: a real block of GENUINELY colored pixels
+            # (S>90, not the S~50 of a cool-tinted gray) that are also bright
+            # enough for that saturation to be meaningful (V>90 floor).
+            strong_block = float(np.mean((S > 90) & (V > 90))) > 0.25
+            is_chromatic = med_s > sat_gate or strong_block
 
             # C. Robust dominant pixel selection.
             # For a chromatic garment the true hue lives in its saturated pixels
             # — focus there so shaded/washed-out pixels don't pull the result
             # toward gray/black. Otherwise take the median of all kept pixels.
             if is_chromatic:
-                thresh = max(40.0, float(np.percentile(S, 50)))
+                thresh = max(30.0, float(np.percentile(S, 40)))
                 sel = S >= thresh
                 core = px[sel] if int(np.sum(sel)) >= 20 else px
+                dom_bgr = np.median(core.astype(np.float32), axis=0)
             else:
-                core = px
-            dom_bgr = np.median(core.astype(np.float32), axis=0)
+                dom_bgr = med_all
 
             dom_rgb = cv2.cvtColor(np.uint8([[dom_bgr]]), cv2.COLOR_BGR2RGB)[0][0]
             rgb_tuple = tuple(int(c) for c in dom_rgb)
 
             color_name = self._name_color(dom_bgr, is_chromatic)
+
+            if n_secondary > 0:
+                # Secondary colors come from the SAME white-balanced, highlight-
+                # dropped pixels — distinct from the dominant and each other.
+                secondary = self._secondary_colors(
+                    px, color_name, n=n_secondary
+                )
+                return color_name, rgb_tuple, secondary
             return color_name, rgb_tuple
         except Exception as e:
             logging.error(f"dominant_color_from_pixels error: {e}")
             return None
+
+    def _name_bgr(self, bgr):
+        """Name a single BGR color, deciding chromatic from its own saturation."""
+        s = int(cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0, 0, 1])
+        name = self._name_color(bgr, s > 35)
+        rgb = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2RGB)[0][0]
+        return name, tuple(int(c) for c in rgb)
+
+    def dominant_color_extcolors(self, pixels, wb_gains=None, tolerance=12):
+        """
+        Second dominant-color estimate using the ``extcolors`` library.
+
+        extcolors groups near-identical pixels (within ``tolerance``) and counts
+        them, returning colors most-frequent first. We take the most frequent
+        group as the dominant color. This is a different bias from the primary
+        method's saturation-gated median (frequency vs. saturation), so the two
+        together flag ambiguous garments.
+
+        The garment's pixels (a flat list with no spatial layout) are packed
+        into an N x 1 RGB image, since extcolors only counts pixels.
+
+        Args:
+            pixels: (N, 3) uint8 BGR ndarray of the garment's pixels
+            wb_gains: optional (3,) BGR gains applied first (same as primary)
+            tolerance: extcolors grouping tolerance (higher = coarser merging)
+        Returns: (color_name, rgb_tuple) or None if too few pixels / unavailable
+        """
+        if pixels is None or len(pixels) < 30:
+            return None
+        try:
+            import extcolors
+            from PIL import Image
+        except Exception as e:
+            logging.warning(f"extcolors unavailable, skipping: {e}")
+            return None
+        try:
+            px = pixels.reshape(-1, 3).astype(np.float32)
+
+            # Same white balance as the primary method.
+            if wb_gains is not None:
+                px = np.clip(px * wb_gains, 0, 255)
+            px = px.astype(np.uint8)
+
+            # Drop blown-out specular highlights, keep darks (as in primary).
+            V = cv2.cvtColor(px.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)[:, 2]
+            keep = V < 250
+            if int(np.sum(keep)) >= 30:
+                px = px[keep]
+
+            # Pack pixels into an N x 1 RGB image (extcolors only counts pixels).
+            rgb_px = cv2.cvtColor(px.reshape(-1, 1, 3), cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb_px, "RGB")
+            colors, _total = extcolors.extract_from_image(
+                img, tolerance=tolerance, limit=10
+            )
+            if not colors:
+                return None
+
+            # Most frequent group = dominant color.
+            top_rgb = colors[0][0]  # (r, g, b)
+            dom_bgr = np.uint8([[[top_rgb[2], top_rgb[1], top_rgb[0]]]])[0, 0]
+            color_name, rgb_tuple = self._name_bgr(dom_bgr)
+            return color_name, rgb_tuple
+        except Exception as e:
+            logging.error(f"dominant_color_extcolors error: {e}")
+            return None
+
+    def _secondary_colors(self, px, dominant_name, n=2):
+        """
+        Extract up to ``n`` secondary colors of a garment, each with a color
+        name DISTINCT from the dominant and from one another.
+
+        The pixels are over-clustered into a richer palette (more than n+1
+        clusters), the clusters are walked largest-first, and a cluster is taken
+        only if its color name has not been used yet (dominant included). A
+        solid garment therefore yields no secondaries (every cluster names the
+        same as the dominant), while a multi-color garment yields its genuinely
+        different colors.
+
+        Args:
+            px: (N, 3) BGR ndarray of the garment's pixels, already white-
+                balanced and with highlights dropped (as in the primary method)
+            dominant_name: the dominant color's name, excluded from secondaries
+            n: how many distinct secondary colors to return
+        Returns: list of {color, rgb, proportion} dicts (may be shorter than n,
+            or empty, if the garment lacks that many distinct colors).
+        """
+        try:
+            pts = px.reshape(-1, 3).astype(np.float32)
+            if len(pts) < 30:
+                return []
+            # Over-cluster so there are enough candidates to find DISTINCT
+            # color names beyond the dominant.
+            k = int(min(6, max(n + 1, len(pts) // 20)))
+            if k < 2:
+                return []
+            km = KMeans(n_clusters=k, n_init=3, random_state=42)
+            labels = km.fit_predict(pts)
+            counts = np.bincount(labels, minlength=k)
+            order = np.argsort(counts)[::-1]  # largest cluster first
+
+            secondary = []
+            used = {dominant_name}  # never repeat the dominant or a prior pick
+            for idx in order:
+                if counts[idx] == 0:
+                    continue
+                center = np.clip(km.cluster_centers_[int(idx)], 0, 255)
+                name, rgb = self._name_bgr(center)
+                if name in used:
+                    continue
+                used.add(name)
+                secondary.append({
+                    "color": name,
+                    "rgb": [int(c) for c in rgb],
+                    "proportion": round(float(counts[idx]) / len(pts), 4),
+                })
+                if len(secondary) >= n:
+                    break
+            return secondary
+        except Exception as e:
+            logging.error(f"_secondary_colors error: {e}")
+            return []
 
     def _classify_color_from_hsv(self, h, s, v, rgb):
         """

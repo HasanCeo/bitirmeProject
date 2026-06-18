@@ -46,7 +46,10 @@ DETECTED_FIRES_DIR = DATA_DIR / "detected_fires"
 DETECTED_FIRES_DIR.mkdir(parents=True, exist_ok=True)
 
 # SORT tracker settings
-SORT_MAX_AGE = 30
+# MAX_AGE = how many frames a track survives WITHOUT a detection (occlusion /
+# YOLO flicker) before it is dropped. Too low -> the same person reappears with
+# a NEW id and gets saved twice; raised to ~1.5s at 30fps to bridge short gaps.
+SORT_MAX_AGE = 45
 SORT_MIN_HITS = 3
 SORT_IOU_THRESHOLD = 0.3
 

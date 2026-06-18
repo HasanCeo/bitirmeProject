@@ -79,12 +79,20 @@ def _merge_shoes(garments):
         return garments
     others = [g for g in garments if g["type"] not in ("left-shoe", "right-shoe")]
     best = max(shoes, key=lambda g: g["area_ratio"])
-    others.append({
+    merged = {
         "type": "shoe",
         "color": best["color"],
         "rgb": best["rgb"],
+        "dom_bgr": best.get("dom_bgr"),
+        "hsv": best.get("hsv"),
+        "secondary_colors": best.get("secondary_colors", []),
         "area_ratio": round(sum(g["area_ratio"] for g in shoes), 4),
-    })
+    }
+    # Preserve the extcolors second opinion from the larger shoe, if present.
+    if "color_extcolors" in best:
+        merged["color_extcolors"] = best["color_extcolors"]
+        merged["rgb_extcolors"] = best["rgb_extcolors"]
+    others.append(merged)
     return others
 
 
@@ -181,20 +189,24 @@ class HumanParser:
             logging.error(f"Human parse error: {e}")
             return None
 
-    def parse_garments(self, frame_bgr, bbox, analyzer, person_mask=None):
+    def parse_garments(self, frame_bgr, bbox, analyzer):
         """
         Full garment pipeline for one detected human.
 
-        Crops the person out of ``frame_bgr`` using ``bbox``, parses the crop
-        into garment regions, and extracts the dominant color of each garment
-        via ``analyzer.dominant_color_from_pixels``.
+        Crops the person out of ``frame_bgr`` using ``bbox`` (the YOLO person
+        bounding box), parses the crop into garment regions with SegFormer, and
+        extracts the dominant color of each garment via
+        ``analyzer.dominant_color_from_pixels``.
+
+        SegFormer's per-pixel label map is the sole authority for which pixels
+        belong to which garment — it already separates background, hair, face,
+        and bare limbs from clothing, so no extra YOLO segmentation mask or skin
+        removal is needed.
 
         Args:
             frame_bgr: Full frame (BGR)
             bbox: (x, y, w, h) of the person in full-frame coordinates
             analyzer: HumanImageAnalyzer (used for color classification)
-            person_mask: Optional raw YOLOv8-seg person mask, used to suppress
-                background pixels that the parser might mislabel.
 
         Returns: metadata dict (see _build_metadata) or None if parsing failed
             / no garments were found.
@@ -212,16 +224,6 @@ class HumanParser:
             if label_map is None:
                 return None
 
-            # Intersect with the YOLO person mask so background that the parser
-            # mislabels as clothing does not pollute the colors.
-            if person_mask is not None:
-                try:
-                    m = cv2.resize(person_mask, (W, H))
-                    person = m[y:y + h, x:x + w] > 0.5
-                    label_map = np.where(person, label_map, 0)
-                except Exception as e:
-                    logging.debug(f"person-mask intersect skipped: {e}")
-
             total_px = crop.shape[0] * crop.shape[1]
             min_px = max(40, int(total_px * 0.005))  # ignore tiny/noisy regions
 
@@ -234,16 +236,36 @@ class HumanParser:
                 cnt = int(region.sum())
                 if cnt < min_px:
                     continue
-                res = analyzer.dominant_color_from_pixels(crop[region], wb_gains)
+                region_px = crop[region]
+                # Primary method: dominant color + its 2 secondary colors.
+                res = analyzer.dominant_color_from_pixels(
+                    region_px, wb_gains, n_secondary=2
+                )
                 if res is None:
                     continue
-                color_name, rgb = res
-                garments.append({
+                color_name, rgb, secondary = res
+                # Dominant color in BGR + its HSV, for inspection/debugging the
+                # naming decision (Hue 0-180, Sat/Val 0-255 on OpenCV's scale).
+                dom_bgr = [int(rgb[2]), int(rgb[1]), int(rgb[0])]
+                hsv = cv2.cvtColor(
+                    np.uint8([[dom_bgr]]), cv2.COLOR_BGR2HSV
+                )[0, 0]
+                garment = {
                     "type": ATR_LABELS[lid],
                     "color": color_name,
                     "rgb": [int(c) for c in rgb],
+                    "dom_bgr": dom_bgr,
+                    "hsv": [int(hsv[0]), int(hsv[1]), int(hsv[2])],
+                    "secondary_colors": secondary,
                     "area_ratio": round(cnt / total_px, 4),
-                })
+                }
+                # Second, independent estimate via the extcolors library
+                # (most-frequent color group). Stored for cross-checking.
+                res2 = analyzer.dominant_color_extcolors(region_px, wb_gains)
+                if res2 is not None:
+                    garment["color_extcolors"] = res2[0]
+                    garment["rgb_extcolors"] = [int(c) for c in res2[1]]
+                garments.append(garment)
 
             if not garments:
                 return None

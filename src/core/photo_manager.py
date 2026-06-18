@@ -144,7 +144,6 @@ class PhotoManager:
                         best_candidate['frame'],
                         best_candidate['bbox'],
                         self.image_analyzer,
-                        person_mask=best_candidate['detection_tuple'][5],
                     )
                 except Exception as e:
                     logging.error(f"Garment parsing failed: {e}")
@@ -343,21 +342,22 @@ class PhotoManager:
                 self.metadata_manager.human_metadata_file, image_metadata
             )
             
-            # Check blacklist
-            is_match, matched_entry = self.blacklist_manager.check_match(image_metadata, 'human')
-            if is_match and self.blacklist_manager.should_trigger_alert(matched_entry):
-                self.blacklist_manager.record_alert(matched_entry, str(filepath))
-                # Return filepath for alert handling
-                return str(filepath)
-            
-            # Add to saved humans list
+            # Record this save FIRST, so the track_id dedup (should_save_human)
+            # always sees it — even on a blacklist match, which returns early.
+            # (Previously the early return skipped this, letting a watch-listed
+            # person be saved repeatedly under the same track_id.)
             self.saved_humans.append({
                 'timestamp': timestamp,
                 'bbox': bbox,
                 'filepath': str(filepath),
                 'track_id': track_id
             })
-            
+
+            # Check blacklist
+            is_match, matched_entry = self.blacklist_manager.check_match(image_metadata, 'human')
+            if is_match and self.blacklist_manager.should_trigger_alert(matched_entry):
+                self.blacklist_manager.record_alert(matched_entry, str(filepath))
+
             return str(filepath)
         except Exception as e:
             logging.error(f"Error saving human photo: {e}")
