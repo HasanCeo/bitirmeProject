@@ -9,6 +9,7 @@ UI is a sidebar + stacked pages: Live, Search, Blacklist.
 """
 
 import os
+import time
 import logging
 from datetime import datetime
 
@@ -33,6 +34,12 @@ from src.config.settings import (
     FIRE_MODEL_PATH, FIRE_CONF_THRESHOLD, FIRE_PERSIST_K, FIRE_PERSIST_N,
     FIRE_NOTIFY_COOLDOWN, DETECTED_FIRES_DIR,
 )
+
+
+# Max width of the frame handed to Qt for *display only*. Detection still runs
+# on the full-resolution frame, so model accuracy is unaffected; this only
+# avoids converting/copying a huge QImage every frame for high-res videos.
+DISPLAY_MAX_WIDTH = 960
 
 
 # ---------------------------------------------------------------------------
@@ -74,8 +81,19 @@ class VideoWorker(QThread):
         self._current_source = None
         self._cap = None
 
+        # playback pacing state
+        self._frame_interval = 1.0 / DEFAULT_VIDEO_FPS
+        self._play_start = None       # perf_counter at playback (re)start
+        self._frame_index = 0         # frames decoded since playback start
+
         # processing state
         self.frame_skip_counter = 0
+        # last detection results, re-drawn on frames where detection did not run
+        # (frame-skip / dropped frames) so the boxes stay steady instead of
+        # flickering on/off every other frame
+        self._last_humans = []
+        self._last_vehicles = []
+        self._last_pets = []
         self.previous_human_tracks = set()
         self.previous_car_tracks = set()
         self.previous_pet_tracks = set()
@@ -94,6 +112,17 @@ class VideoWorker(QThread):
 
     def stop(self):
         self._alive = False
+
+    def force_release(self):
+        """Son çare: thread zamanında durmazsa capture'ı zorla serbest bırak.
+        OpenCV release() çağrısı thread-safe değildir; yalnızca run() döngüsü
+        artık çalışmıyorken (wait timeout sonrası) GUI thread'inden çağrılmalı."""
+        cap, self._cap = self._cap, None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
     # ---- capture management ----
     def _open_capture(self, source):
@@ -116,6 +145,11 @@ class VideoWorker(QThread):
             self.statusChanged.emit(f"● Playing video: {os.path.basename(source)}", "ok")
         self._cap = cap
         self._current_source = source
+        # Native frame interval for wall-clock pacing of video files.
+        fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 0
+        if not fps or fps <= 1 or fps > 1000:
+            fps = DEFAULT_VIDEO_FPS
+        self._frame_interval = 1.0 / fps
         if not cap.isOpened():
             self.statusChanged.emit("● Could not open source", "danger")
             self.logMessage.emit("Could not open video source")
@@ -169,9 +203,12 @@ class VideoWorker(QThread):
             self._mutex.unlock()
             if pending:
                 self._open_capture(src)
+                self._play_start = None      # reset pacing for the new source
+                self._last_humans, self._last_vehicles, self._last_pets = [], [], []
 
             if self._paused or self._cap is None:
                 self.msleep(30)
+                self._play_start = None      # re-anchor clock on resume
                 continue
 
             ret, frame = self._cap.read()
@@ -179,15 +216,37 @@ class VideoWorker(QThread):
                 # video ended -> loop it; webcam hiccup -> brief wait
                 if isinstance(self._current_source, str):
                     self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    self._play_start = None
                 else:
                     self.msleep(30)
                 continue
 
-            try:
-                self._process(frame)
-            except Exception as e:
-                logging.error(f"frame processing error: {e}")
-            self.msleep(15)
+            is_file = isinstance(self._current_source, str)
+            if self._play_start is None:
+                self._play_start = time.perf_counter()
+                self._frame_index = 0
+
+            # Wall-clock pacing (video files only; webcams self-pace at read()).
+            # If we're ahead of schedule, wait; if we've fallen more than one
+            # frame behind, drop this frame's processing to catch up so the
+            # video plays at its true speed instead of dragging on heavy frames.
+            render = True
+            if is_file:
+                target = self._play_start + self._frame_index * self._frame_interval
+                now = time.perf_counter()
+                if now < target:
+                    self.msleep(int((target - now) * 1000))
+                elif now - target > self._frame_interval:
+                    render = False           # behind -> drop to catch up
+            self._frame_index += 1
+
+            if render:
+                try:
+                    self._process(frame)
+                except Exception as e:
+                    logging.error(f"frame processing error: {e}")
+            if not is_file:
+                self.msleep(15)
 
         if self._cap is not None:
             self._cap.release()
@@ -216,11 +275,16 @@ class VideoWorker(QThread):
                     pets = []
             if self.fire_enabled and self.fire is not None:
                 fires = self.fire.detect_fire(frame)
+            # refresh persistent boxes so non-detection frames keep showing them
+            self._last_humans, self._last_vehicles, self._last_pets = \
+                humans, vehicles, pets
+        elif not active:
+            self._last_humans, self._last_vehicles, self._last_pets = [], [], []
 
         if active:
             now = datetime.now()
-            # Humans
-            for (x, y, w, h, tid, mask) in humans:
+            # Humans (draw cached boxes every frame; collect only on detection)
+            for (x, y, w, h, tid, mask) in self._last_humans:
                 cv2.rectangle(disp, (x, y), (x + w, y + h), COLOR_HUMAN, 2)
                 cv2.putText(disp, f"Human {tid}", (x, y - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_HUMAN, 2)
@@ -228,7 +292,7 @@ class VideoWorker(QThread):
                 self._collect(humans, frame, now, 'human')
 
             # Vehicles
-            for (x, y, w, h, cname, tid, mask) in vehicles:
+            for (x, y, w, h, cname, tid, mask) in self._last_vehicles:
                 cv2.rectangle(disp, (x, y), (x + w, y + h), COLOR_VEHICLE, 2)
                 cv2.putText(disp, f"{cname} {tid}", (x, y - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_VEHICLE, 2)
@@ -236,7 +300,7 @@ class VideoWorker(QThread):
                 self._collect(vehicles, frame, now, 'car')
 
             # Pets
-            for (x, y, w, h, cname, tid, mask) in pets:
+            for (x, y, w, h, cname, tid, mask) in self._last_pets:
                 cv2.rectangle(disp, (x, y), (x + w, y + h), COLOR_PET, 2)
                 cv2.putText(disp, f"{cname} {tid}", (x, y - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_PET, 2)
@@ -250,7 +314,13 @@ class VideoWorker(QThread):
                     self.last_fire_time = now
                 self._notify_fire(frame)
 
-        # emit for display
+        # emit for display (downscale the *display copy* only; detection above
+        # already ran on the full-resolution frame, so accuracy is unchanged)
+        dh, dw = disp.shape[:2]
+        if dw > DISPLAY_MAX_WIDTH:
+            scale = DISPLAY_MAX_WIDTH / dw
+            disp = cv2.resize(disp, (DISPLAY_MAX_WIDTH, int(dh * scale)),
+                              interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
@@ -655,7 +725,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         try:
             self.worker.stop()
-            self.worker.wait(4000)
+            if not self.worker.wait(4000):
+                # Thread zamanında durmadı -> kamerayı zorla serbest bırak,
+                # sonra thread'in bitmesini bekle ki süreç temiz kapansın.
+                self.worker.force_release()
+                self.worker.wait(2000)
         except Exception:
             pass
         super().closeEvent(e)

@@ -12,7 +12,18 @@ The model is downloaded automatically from the Hugging Face hub on first use
 and cached under ~/.cache/huggingface.
 """
 
+import os
 import logging
+
+# Force `transformers` to use the PyTorch backend only. By default it probes
+# for TensorFlow/Flax at import time; on this machine the TensorFlow build is
+# broken (native DLL load fails + a protobuf DType registration clash), which
+# made the SegFormer clothing parser fail to load and fall back to heuristics.
+# We use torch exclusively, so disable the TF/Flax probes. Must be set before
+# transformers is imported (done lazily in _ensure_loaded below).
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+os.environ.setdefault("USE_TORCH", "1")
 
 import cv2
 import numpy as np
