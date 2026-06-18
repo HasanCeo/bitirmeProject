@@ -31,6 +31,9 @@ wheels/
 *~
 tempCodeRunnerFile.py
 
+# macOS
+.DS_Store
+
 # Logs
 logs/
 *.log
@@ -40,6 +43,11 @@ logs/
 *.pth
 *.onnx
 
-# Detected images (optional - uncomment if you don't want to track images)
-# detected_humans/
-# detected_cars/
+# Detected runtime outputs (volatile - not source)
+data/detected_humans/
+data/detected_cars/
+data/detected_pets/
+data/detected_fires/
+
+# Local test videos
+excluded/

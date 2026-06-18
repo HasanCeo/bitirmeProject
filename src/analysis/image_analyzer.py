@@ -353,38 +353,13 @@ class HumanImageAnalyzer:
             if len(pixels) < 30:
                 return self._fallback_color_detection(roi)
 
-            # 3. Drop ONLY blown-out specular highlights (near-255). We must KEEP
-            # dark pixels: black clothing's signal lives at low brightness, so the
-            # old "remove very dark" filter turned black garments white (the few
-            # bright folds/reflections were all that survived). Letting K-means
-            # vote over all remaining pixels makes the true majority color win.
-            hsv_pixels = cv2.cvtColor(
-                pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV
-            ).reshape(-1, 3)
-            brightness = hsv_pixels[:, 2]
-            valid = brightness < 250
-            filtered = pixels[valid] if np.sum(valid) >= 50 else pixels
-
-            # 4. K-MEANS — dominant remaining (clothing) color.
-            # Cap clusters by the number of DISTINCT colors to avoid sklearn's
-            # ConvergenceWarning (and degenerate fits) on near-uniform regions.
-            data = filtered.astype(np.float32)
-            n_unique = len(np.unique(data, axis=0))
-            n_clusters = max(1, min(4, n_unique))
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(data)
-            dominant_label = Counter(labels).most_common(1)[0][0]
-            dominant_bgr = kmeans.cluster_centers_[dominant_label].astype(int)
-
-            # 5. Convert + classify
-            dominant_rgb = cv2.cvtColor(
-                np.uint8([[dominant_bgr]]), cv2.COLOR_BGR2RGB
-            )[0][0]
-            hsv = cv2.cvtColor(np.uint8([[dominant_bgr]]), cv2.COLOR_BGR2HSV)[0][0]
-            rgb_tuple = tuple(int(c) for c in dominant_rgb)
-            color_name = self._classify_color_from_hsv(hsv[0], hsv[1], hsv[2], rgb_tuple)
-
-            return color_name, rgb_tuple
+            # Classify the dominant color (white-balanced, perceptual naming).
+            # Gains are estimated from the WHOLE frame, not this garment.
+            wb_gains = self.estimate_wb_gains(image)
+            result = self.dominant_color_from_pixels(pixels, wb_gains)
+            if result is None:
+                return self._fallback_color_detection(roi)
+            return result
 
         except Exception as e:
             logging.error(f"K-means color detection error: {e}")
@@ -392,6 +367,142 @@ class HumanImageAnalyzer:
 
             logging.error(traceback.format_exc())
             return "gray", (128, 128, 128)
+
+    @staticmethod
+    def estimate_wb_gains(image_bgr, p=6, clip=(0.6, 1.8)):
+        """
+        Estimate per-channel white-balance gains using the shades-of-gray
+        (Minkowski p-norm) illuminant assumption.
+
+        MUST be computed over the WHOLE frame, never a single garment — gray-
+        world on one garment would cancel that garment's own color. Gains are
+        clamped so a strongly colored scene can't over-correct.
+
+        Returns: (3,) float32 BGR gain array, or None on failure.
+        """
+        try:
+            img = image_bgr.reshape(-1, 3).astype(np.float32)
+            norm = np.power(np.mean(np.power(img, p), axis=0), 1.0 / p)  # BGR
+            norm = np.clip(norm, 1e-6, None)
+            gains = norm.mean() / norm
+            return np.clip(gains, clip[0], clip[1]).astype(np.float32)
+        except Exception:
+            return None
+
+    def _name_color(self, bgr, is_chromatic):
+        """
+        Name a single BGR color, given whether the garment was judged chromatic
+        (vs neutral) from its saturation distribution.
+
+        Naming is HUE-based for chromatic colors — a 1-D hue decision does NOT
+        confuse a dark-but-saturated color (e.g. navy/dark-blue) with gray, the
+        way a 3-D perceptual (ΔE/Lab) nearest-neighbour does. Neutrals are named
+        by brightness.
+        """
+        hsv = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0, 0]
+        h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
+        rgb = tuple(int(c) for c in cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2RGB)[0, 0])
+
+        # Neutral garment, or near-black noise -> grayscale ramp by brightness.
+        if not is_chromatic or v < 35:
+            if v < 50:
+                return "black"
+            if v < 90:
+                return "dark_gray"
+            if v < 150:
+                return "gray"
+            if v < 205:
+                return "silver"
+            return "white"
+
+        # Brown = a dark, warm (red/orange) hue — must be tested before the
+        # orange/red hue buckets, otherwise brown reads as orange.
+        if h < 25 and v < 130 and s > 60:
+            return "brown"
+        # Warm, desaturated and bright -> beige/cream.
+        if s < 60 and v > 160 and rgb[0] >= rgb[1] >= rgb[2]:
+            return "beige"
+
+        # Saturated colors by hue (OpenCV 0-180 scale).
+        if h < 10 or h > 170:
+            return "red"
+        if h < 25:
+            return "orange"
+        if h < 35:
+            return "yellow"
+        if h < 85:
+            return "green"
+        if h < 130:
+            return "blue"
+        if h < 150:
+            return "purple"
+        return "pink"
+
+    def classify_color_lab(self, bgr):
+        """Name a single BGR color (kept for API compatibility)."""
+        s = int(cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0, 0, 1])
+        return self._name_color(bgr, s >= 40)
+
+    def dominant_color_from_pixels(self, pixels, wb_gains=None):
+        """
+        Classify the dominant color of an arbitrary set of garment pixels.
+
+        Pipeline: (A) white-balance the pixels with frame-level gains, then
+        (C) pick the garment's representative color by a saturation-gated
+        median (robust to shadow/highlight, unlike "largest KMeans cluster"),
+        then name it by hue (neutral vs chromatic decided from the saturation
+        distribution, not a single pixel).
+
+        Args:
+            pixels: (N, 3) uint8 BGR ndarray of the garment's pixels
+            wb_gains: optional (3,) BGR gains from estimate_wb_gains() applied
+                before classification (illuminant normalization)
+        Returns: (color_name, rgb_tuple) or None if too few pixels
+        """
+        if pixels is None or len(pixels) < 30:
+            return None
+        try:
+            px = pixels.reshape(-1, 3).astype(np.float32)
+
+            # A. White balance (illuminant normalization)
+            if wb_gains is not None:
+                px = np.clip(px * wb_gains, 0, 255)
+            px = px.astype(np.uint8)
+
+            hsv = cv2.cvtColor(px.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+            S = hsv[:, 1]
+            V = hsv[:, 2]
+
+            # Drop blown-out specular highlights, but KEEP dark pixels (black
+            # clothing's signal lives at low brightness).
+            keep = V < 250
+            if int(np.sum(keep)) >= 30:
+                px, S, V = px[keep], S[keep], V[keep]
+
+            # Chromatic vs neutral decision from the saturation DISTRIBUTION (a
+            # clearly colored garment can then never be named gray/black).
+            is_chromatic = float(np.mean(S > 40)) > 0.25
+
+            # C. Robust dominant pixel selection.
+            # For a chromatic garment the true hue lives in its saturated pixels
+            # — focus there so shaded/washed-out pixels don't pull the result
+            # toward gray/black. Otherwise take the median of all kept pixels.
+            if is_chromatic:
+                thresh = max(40.0, float(np.percentile(S, 50)))
+                sel = S >= thresh
+                core = px[sel] if int(np.sum(sel)) >= 20 else px
+            else:
+                core = px
+            dom_bgr = np.median(core.astype(np.float32), axis=0)
+
+            dom_rgb = cv2.cvtColor(np.uint8([[dom_bgr]]), cv2.COLOR_BGR2RGB)[0][0]
+            rgb_tuple = tuple(int(c) for c in dom_rgb)
+
+            color_name = self._name_color(dom_bgr, is_chromatic)
+            return color_name, rgb_tuple
+        except Exception as e:
+            logging.error(f"dominant_color_from_pixels error: {e}")
+            return None
 
     def _classify_color_from_hsv(self, h, s, v, rgb):
         """

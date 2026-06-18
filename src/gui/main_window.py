@@ -8,6 +8,7 @@ import logging
 import time
 import os
 from datetime import datetime
+import threading
 from threading import Thread
 from pathlib import Path
 
@@ -15,13 +16,15 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 
-from src.detectors import MotionDetector, FireDetector
+from src.detectors import MotionDetector, FireDetector, FireSmokeDetector
 from src.core.metadata_manager import MetadataManager
 from src.core.blacklist_manager import BlacklistManager
 from src.config.settings import (
     DEFAULT_MOTION_THRESHOLD, DEFAULT_MOTION_MIN_AREA, DEFAULT_FIRE_MIN_AREA,
     DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT, DEFAULT_VIDEO_FPS,
-    ESP32_CAM_STREAM_URL, ESP32_CAM_RECONNECT_DELAY, ESP32_CAM_TIMEOUT
+    ESP32_CAM_STREAM_URL, ESP32_CAM_RECONNECT_DELAY, ESP32_CAM_TIMEOUT,
+    FIRE_MODEL_PATH, FIRE_CONF_THRESHOLD, FIRE_PERSIST_K, FIRE_PERSIST_N,
+    FIRE_NOTIFY_COOLDOWN, DETECTED_FIRES_DIR
 )
 from src.config.constants import (
     COLOR_HUMAN, COLOR_FIRE, COLOR_VEHICLE, COLOR_PET,
@@ -88,25 +91,48 @@ class WebcamMonitor:
             min_area=DEFAULT_MOTION_MIN_AREA,
         )
         self._yolo_detector = None  # Loaded in background for fast startup
+
+        # Fire detection: prefer the trained YOLO fire/smoke model. Start on the
+        # basic color detector as a fallback; if trusted weights are present the
+        # background loader below swaps in the accurate model.
         self.fire_detector = FireDetector(min_area=DEFAULT_FIRE_MIN_AREA)
-        
+        self._fire_yolo = FireSmokeDetector(
+            FIRE_MODEL_PATH,
+            conf=FIRE_CONF_THRESHOLD,
+            persist_k=FIRE_PERSIST_K,
+            persist_n=FIRE_PERSIST_N,
+        )
+
         # Setup GUI
         self.setup_gui()
         
+        # SCHP-equivalent garment parser (loaded lazily / in background below)
+        self._human_parser = None
+
         # Load heavy modules (sklearn, ultralytics) in background - window appears immediately
         def _load_heavy_modules():
             try:
                 from src.analysis.image_analyzer import HumanImageAnalyzer
+                from src.analysis.human_parser import HumanParser
                 from src.core.photo_manager import PhotoManager
                 from src.core.search_engine import SearchEngine
                 self.image_analyzer = HumanImageAnalyzer()
+                self._human_parser = HumanParser()
                 self.photo_manager = PhotoManager(
                     self.image_analyzer,
                     self.metadata_manager,
-                    self.blacklist_manager
+                    self.blacklist_manager,
+                    human_parser=self._human_parser
                 )
                 self.search_engine = SearchEngine(self.image_analyzer, self.metadata_manager)
                 self.root.after(0, self._on_analysis_ready)
+
+                # Warm up the garment parser (downloads from HF on first run) so
+                # the first human save isn't blocked on a multi-second load.
+                self.root.after(0, lambda: self.log_info("Loading clothing parser model..."))
+                ok = self._human_parser.preload()
+                msg = "Clothing parser ready" if ok else "Clothing parser unavailable (using heuristic)"
+                self.root.after(0, lambda m=msg: self.log_info(m))
             except Exception as e:
                 logging.error(f"Failed to load analysis modules: {e}")
                 self.root.after(0, lambda err=str(e): self.log_info(f"Analysis load failed: {err}"))
@@ -114,19 +140,64 @@ class WebcamMonitor:
 
         def _load_yolo():
             try:
+                from src.config.settings import MODELS_DIR, YOLO_MODEL_PATH
+                import requests
+
+                model_file = Path(YOLO_MODEL_PATH)
+                if not model_file.exists():
+                    # Download with progress reporting
+                    model_name = "yolov8n-seg.pt"
+                    url = f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{model_name}"
+                    dest = Path(MODELS_DIR) / model_name
+                    self.root.after(0, lambda: self.log_info("Downloading YOLO model..."))
+                    resp = requests.get(url, stream=True, timeout=60)
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("content-length", 0))
+                    downloaded = 0
+                    with open(dest, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total:
+                                    pct = int(downloaded * 100 / total)
+                                    mb_done = downloaded / 1_048_576
+                                    mb_total = total / 1_048_576
+                                    msg = f"Downloading model: {pct}% ({mb_done:.1f}/{mb_total:.1f} MB)"
+                                    self.root.after(0, lambda m=msg: self.log_info(m))
+                    self.root.after(0, lambda: self.log_info("Download complete. Loading model..."))
+
                 from src.detectors.yolo_multi_detector import YoloMultiObjectDetector
                 detector = YoloMultiObjectDetector()
                 self._yolo_detector = detector
                 self.root.after(0, self._on_model_ready)
             except Exception as e:
-                logging.error(f"Failed to load YOLO model: {e}")
-                self.root.after(0, lambda: self.log_info(f"Model load failed: {e}"))
+                msg = str(e)
+                logging.error(f"Failed to load YOLO model: {msg}")
+                self.root.after(0, lambda m=msg: self.log_info(f"Model load failed: {m}"))
         Thread(target=_load_yolo, daemon=True).start()
+
+        def _load_fire_model():
+            # Activate the trained fire/smoke detector if trusted weights exist;
+            # otherwise keep the basic color detector (already set above).
+            try:
+                if self._fire_yolo.preload():
+                    self.fire_detector = self._fire_yolo
+                    self.root.after(0, lambda: self.log_info("Fire/smoke model active (YOLO)"))
+                else:
+                    self.root.after(0, lambda: self.log_info(
+                        f"Fire model not found - using basic detector. "
+                        f"Add weights at {FIRE_MODEL_PATH} for accurate fire/smoke detection."
+                    ))
+            except Exception as e:
+                logging.error(f"Fire model load failed: {e}")
+        Thread(target=_load_fire_model, daemon=True).start()
         
         # Variables for frame processing
         self.current_frame = None
         self.last_motion_time = None
         self.last_fire_time = None
+        self.last_fire_notify = None  # cooldown for Telegram fire alerts
         self.frame_skip_counter = 0
         self.frame_skip_interval = DEFAULT_FRAME_SKIP_INTERVAL
         self.last_humans_detected = []
@@ -604,6 +675,27 @@ class WebcamMonitor:
         else:  # Overnight range
             return current_hour >= self.start_hour or current_hour <= self.end_hour
     
+    def _open_video_capture(self, path):
+        """
+        Open a video file with a decoder that won't crash the app.
+
+        On macOS, OpenCV's FFmpeg H.264 decoder uses frame-level multithreading
+        that races with the Torch / YOLO inference threads and aborts the whole
+        process ("Assertion fctx->async_lock failed at pthread_frame.c"). Apple's
+        AVFoundation backend uses the OS-native decoder (no pthread_frame), so we
+        prefer it and only fall back to FFmpeg for containers AVFoundation can't
+        open (e.g. some .mkv / .flv files).
+        """
+        import sys
+        if sys.platform == 'darwin':
+            cap = cv2.VideoCapture(path, cv2.CAP_AVFOUNDATION)
+            if cap.isOpened():
+                logging.info("Video opened with AVFoundation backend")
+                return cap
+            cap.release()
+            logging.warning("AVFoundation could not open video; falling back to FFmpeg")
+        return cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+
     def start_detection(self):
         """Start video detection"""
         if self.video_source == "esp32cam":
@@ -649,7 +741,7 @@ class WebcamMonitor:
                 self.cap.release()
                 self.cap = cv2.VideoCapture(self.video_source)
         else:
-            self.cap = cv2.VideoCapture(self.video_source)
+            self.cap = self._open_video_capture(self.video_source)
         if not self.cap.isOpened():
             source_name = "video file" if isinstance(self.video_source, str) else "webcam"
             self.status_label.config(text="● Kamera Hatası", foreground=self.colors['danger'])
@@ -683,6 +775,16 @@ class WebcamMonitor:
         """Stop video detection"""
         self.running = False
         self.video_paused = False
+
+        # Wait for the processing thread to fully exit BEFORE releasing the
+        # capture or letting a new thread start. Otherwise the old thread keeps
+        # reading from a released capture and runs Torch/MPS inference at the
+        # same time as the new thread, which crashes the process (SIGTRAP).
+        t = getattr(self, 'video_thread', None)
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=5.0)
+        self.video_thread = None
+
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -752,6 +854,37 @@ class WebcamMonitor:
                                     foreground=self.colors['warning'] if self.video_paused else self.colors['success'])
             self.log_info(f"Video {status.lower()}")
     
+    def _notify_fire(self, frame):
+        """
+        Send a Telegram fire alert (text + snapshot), like a blacklist alert.
+
+        Reuses the blacklist's TelegramNotifier. Rate-limited by
+        FIRE_NOTIFY_COOLDOWN so a sustained fire doesn't spam notifications.
+        No-ops when Telegram isn't configured.
+        """
+        notifier = getattr(self.blacklist_manager, 'notifier', None)
+        if notifier is None or not getattr(notifier, 'enabled', False):
+            return
+
+        now = datetime.now()
+        if self.last_fire_notify is not None and \
+           (now - self.last_fire_notify).total_seconds() < FIRE_NOTIFY_COOLDOWN:
+            return
+        self.last_fire_notify = now
+
+        try:
+            photo_path = str(DETECTED_FIRES_DIR / f"fire_{now.strftime('%Y%m%d_%H%M%S')}.jpg")
+            cv2.imwrite(photo_path, frame)  # frame is BGR
+            message = (
+                "🔥 YANGIN UYARISI\n"
+                "Kamera görüntüsünde ateş tespit edildi!\n\n"
+                f"Zaman: {now.strftime('%d.%m.%Y %H:%M:%S')}"
+            )
+            notifier.send_alert(message, photo_path)
+            logging.info("Fire Telegram alert sent")
+        except Exception as e:
+            logging.error(f"Fire notification failed: {e}")
+
     def log_info(self, message):
         """Add message to info text and log file"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -865,18 +998,15 @@ class WebcamMonitor:
             
             # Draw detections
             if detection_active:
-                # Draw fire
+                # Fire: detection only — no bounding box drawn on the video.
                 if self.fire_detection_enabled and len(self.last_fires_detected) > 0:
-                    for (x, y, w, h) in self.last_fires_detected:
-                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), COLOR_FIRE, 3)
-                        cv2.putText(display_frame, "FIRE!", (x, y - 10),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_FIRE, 2)
-                    
                     if should_process_detection:
                         current_time = datetime.now()
                         if self.last_fire_time is None or (current_time - self.last_fire_time).seconds > 3:
                             self.log_info(f"FIRE DETECTED! Count: {len(self.last_fires_detected)}")
                             self.last_fire_time = current_time
+                        # Telegram alert (with its own cooldown), like blacklist
+                        self._notify_fire(frame)
                 
                 # Draw humans
                 if len(self.last_humans_detected) > 0:

@@ -8,6 +8,24 @@ from typing import List, Tuple, Dict, Any
 from src.core.metadata_manager import MetadataManager
 from src.analysis.image_analyzer import HumanImageAnalyzer
 
+# Query item vocabulary -> normalized garment item (the vocab stored in
+# garments' detected_items). Lets "jacket"/"t-shirt" match an "upper-clothes"
+# region and "cap" match a "hat".
+_QUERY_ITEM_NORMALIZE = {
+    'shirt': 'shirt', 'tshirt': 'shirt', 'jacket': 'shirt',
+    'hat': 'hat', 'cap': 'hat',
+    'pants': 'pants', 'skirt': 'skirt', 'dress': 'dress',
+    'bag': 'bag', 'shoe': 'shoe', 'shoes': 'shoe',
+    'scarf': 'scarf', 'sunglasses': 'sunglasses', 'belt': 'belt',
+}
+
+# Garment 'type' (ATR names stored in `garments`) -> normalized item.
+_GARMENT_TYPE_TO_ITEM = {
+    'upper-clothes': 'shirt', 'pants': 'pants', 'skirt': 'skirt',
+    'dress': 'dress', 'hat': 'hat', 'belt': 'belt', 'shoe': 'shoe',
+    'bag': 'bag', 'scarf': 'scarf', 'sunglasses': 'sunglasses',
+}
+
 
 class SearchEngine:
     """Search engine for finding detected objects matching queries"""
@@ -153,44 +171,9 @@ class SearchEngine:
         """
         match_score = 0.0
         confidence = 0.0
-        
+
         if is_human:
-            # Check color match in multiple places
-            entry_colors = entry.get('colors', [])
-            upper_clothing = entry.get('upper_clothing', {})
-            lower_clothing = entry.get('lower_clothing', {})
-            upper_color = upper_clothing.get('color', '').lower()
-            lower_color = lower_clothing.get('color', '').lower()
-            
-            # Combine all color sources
-            all_colors = [c.lower() for c in entry_colors]
-            if upper_color:
-                all_colors.append(upper_color)
-            if lower_color:
-                all_colors.append(lower_color)
-            
-            if color:
-                if color in all_colors:
-                    match_score += 0.7
-                    confidence += 0.7
-                elif not all_colors:
-                    return 0.0  # Query requires color but image has none
-            
-            # Check item match
-            entry_items = entry.get('detected_items', [])
-            if item:
-                if item in entry_items:
-                    match_score += 0.3
-                    confidence += 0.3
-                elif item in ['pants', 'shirt', 'tshirt', 'jacket']:
-                    if (item in ['pants'] and lower_clothing.get('type') == 'pants') or \
-                       (item in ['shirt', 'tshirt', 'jacket'] and 
-                        upper_clothing.get('type') in ['shirt', 'tshirt', 'jacket']):
-                        match_score += 0.3
-                        confidence += 0.3
-                elif color and color in all_colors:
-                    match_score += 0.2
-                    confidence += 0.2
+            return self._match_human(entry, color, item)
         else:
             # Vehicle matching
             entry_colors = entry.get('colors', [])
@@ -207,5 +190,66 @@ class SearchEngine:
                 confidence += 0.3
             elif object_type:
                 confidence += 0.3
-        
+
         return confidence
+
+    def _match_human(self, entry: Dict[str, Any], color: str, item: str) -> float:
+        """
+        Score a human entry against a (color, item) query using the `garments`
+        field as the source of truth.
+
+        Strongest signal is a SINGLE garment matching both the requested item
+        and color (e.g. a *red hat*, not "wears red somewhere and a hat
+        somewhere"). Falls back to the flat `colors` / `detected_items`
+        aggregates for older records that predate `garments`.
+        """
+        # Per-garment (item, color) pairs from the rich field.
+        pairs = []
+        for g in entry.get('garments', []):
+            gtype = _GARMENT_TYPE_TO_ITEM.get((g.get('type') or '').lower())
+            gcolor = (g.get('color') or '').lower()
+            if gtype or gcolor:
+                pairs.append((gtype, gcolor))
+
+        # Aggregates: prefer garment-derived, else fall back to stored flat lists.
+        flat_colors = [c.lower() for c in entry.get('colors', [])]
+        flat_items = [i.lower() for i in entry.get('detected_items', [])]
+        all_colors = [c for _, c in pairs if c] or flat_colors
+        all_items = [t for t, _ in pairs if t] or flat_items
+
+        norm_item = _QUERY_ITEM_NORMALIZE.get(item) if item else None
+
+        # Color + item query -> demand precision.
+        if color and norm_item:
+            if any(t == norm_item and c == color for t, c in pairs):
+                return 1.0  # one garment is exactly that color AND item
+
+            # If the requested item was actually parsed as a garment, we know its
+            # real color -> a color mismatch means "wrong color" (e.g. red hat vs
+            # query 'blue hat'), so reject rather than reward coincidental blue
+            # elsewhere on the person.
+            item_colors = [c for t, c in pairs if t == norm_item]
+            if item_colors:
+                return 0.3   # right item, wrong color -> below match threshold
+
+            # Item not among parsed garments; fall back to flat aggregates
+            # (covers older records without per-garment data).
+            item_ok = norm_item in all_items
+            color_ok = color in all_colors
+            if item_ok and color_ok:
+                return 0.8   # both present, but not provably the same garment
+            if item_ok:
+                return 0.45  # item present, color absent -> below match threshold
+            if color_ok:
+                return 0.5   # color present, item absent -> below match threshold
+            return 0.0
+
+        # Color-only query.
+        if color:
+            return 0.7 if color in all_colors else 0.0
+
+        # Item-only query.
+        if norm_item:
+            return 0.6 if norm_item in all_items else 0.0
+
+        return 0.0

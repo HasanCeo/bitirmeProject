@@ -31,6 +31,20 @@ DEFAULT_MOTION_THRESHOLD = 30
 DEFAULT_MOTION_MIN_AREA = 500
 DEFAULT_FIRE_MIN_AREA = 100
 
+# Fire/smoke YOLO model. Drop a trusted YOLOv8 fire/smoke .pt here to enable the
+# accurate detector; if absent, the app falls back to the basic color detector.
+_fire_candidates = [MODELS_DIR / "fire.pt", BASE_DIR / "fire.pt"]
+FIRE_MODEL_PATH = next((str(p) for p in _fire_candidates if p.exists()),
+                       str(MODELS_DIR / "fire.pt"))
+FIRE_CONF_THRESHOLD = 0.40   # minimum detection confidence
+FIRE_PERSIST_K = 3           # must appear in >= K of the last N frames
+FIRE_PERSIST_N = 5           # temporal confirmation window
+FIRE_NOTIFY_COOLDOWN = 60    # seconds between Telegram fire alerts (anti-spam)
+
+# Directory for fire snapshot images attached to Telegram alerts
+DETECTED_FIRES_DIR = DATA_DIR / "detected_fires"
+DETECTED_FIRES_DIR.mkdir(parents=True, exist_ok=True)
+
 # SORT tracker settings
 SORT_MAX_AGE = 30
 SORT_MIN_HITS = 3

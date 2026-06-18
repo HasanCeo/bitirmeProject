@@ -89,15 +89,22 @@ class BlacklistManager:
                 if entry['object_type'] == object_type or entry['object_type'] == 'any':
                     query = entry['query'].lower()
                     
-                    # For humans: check upper and lower clothing
+                    # For humans: match any garment color against the query.
                     if object_type == 'human':
-                        upper_color = metadata.get('upper_clothing', {}).get('color', '').lower()
-                        lower_color = metadata.get('lower_clothing', {}).get('color', '').lower()
-                        
-                        if (upper_color and upper_color in query) or \
-                           (lower_color and lower_color in query) or \
-                           (upper_color in query.split() or lower_color in query.split()):
-                            return True, entry
+                        garment_colors = [
+                            (g.get('color') or '').lower()
+                            for g in metadata.get('garments', [])
+                        ]
+                        garment_colors = [c for c in garment_colors if c]
+                        # Fall back to the flat colors list for older records
+                        # that predate the `garments` field.
+                        if not garment_colors:
+                            garment_colors = [c.lower() for c in metadata.get('colors', [])]
+
+                        query_words = set(query.split())
+                        for c in garment_colors:
+                            if c in query or c in query_words:
+                                return True, entry
                     
                     # For vehicles: check colors and vehicle type
                     elif object_type in ['vehicle', 'car', 'truck', 'bus', 'motorcycle']:

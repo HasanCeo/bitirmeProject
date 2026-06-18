@@ -21,20 +21,26 @@ from src.analysis.image_analyzer import HumanImageAnalyzer
 class PhotoManager:
     """Manages photo saving, candidate frame collection, and quality-based selection"""
     
-    def __init__(self, image_analyzer: HumanImageAnalyzer, 
+    def __init__(self, image_analyzer: HumanImageAnalyzer,
                  metadata_manager: MetadataManager,
-                 blacklist_manager: BlacklistManager):
+                 blacklist_manager: BlacklistManager,
+                 human_parser=None):
         """
         Initialize photo manager
-        
+
         Args:
             image_analyzer: Image analyzer for metadata extraction
             metadata_manager: Metadata manager for saving metadata
             blacklist_manager: Blacklist manager for security alerts
+            human_parser: Optional HumanParser (SCHP-equivalent garment parser).
+                When provided, the best saved human frame is parsed into garment
+                regions and each garment's color is recorded. Falls back to the
+                heuristic color estimate when None or when parsing fails.
         """
         self.image_analyzer = image_analyzer
         self.metadata_manager = metadata_manager
         self.blacklist_manager = blacklist_manager
+        self.human_parser = human_parser
         
         # Photo directories
         self.human_photos_dir = DETECTED_HUMANS_DIR
@@ -129,18 +135,41 @@ class PhotoManager:
 
         # Save the best frame
         if is_human:
-            # Temporal voting: estimate clothing colors across candidate frames
-            # (robust to single-frame motion blur / lighting), then save the best
-            # quality frame as the photo but with the voted colors as metadata.
-            color_override = self.image_analyzer.vote_clothing_colors(
-                candidates_dict[track_id]
-            )
-            filepath = self.save_human_photo(
-                best_candidate['frame'],
-                best_candidate['detection_tuple'],
-                best_candidate['timestamp'],
-                color_override=color_override
-            )
+            # Preferred path: run the SCHP-equivalent garment parser on the best
+            # frame to get real per-garment regions and their colors.
+            parse_result = None
+            if self.human_parser is not None:
+                try:
+                    parse_result = self.human_parser.parse_garments(
+                        best_candidate['frame'],
+                        best_candidate['bbox'],
+                        self.image_analyzer,
+                        person_mask=best_candidate['detection_tuple'][5],
+                    )
+                except Exception as e:
+                    logging.error(f"Garment parsing failed: {e}")
+                    parse_result = None
+
+            if parse_result:
+                filepath = self.save_human_photo(
+                    best_candidate['frame'],
+                    best_candidate['detection_tuple'],
+                    best_candidate['timestamp'],
+                    parse_result=parse_result
+                )
+            else:
+                # Fallback: temporal voting across candidate frames (robust to
+                # single-frame motion blur / lighting) using the heuristic
+                # torso/legs color estimate.
+                color_override = self.image_analyzer.vote_clothing_colors(
+                    candidates_dict[track_id]
+                )
+                filepath = self.save_human_photo(
+                    best_candidate['frame'],
+                    best_candidate['detection_tuple'],
+                    best_candidate['timestamp'],
+                    color_override=color_override
+                )
         else:
             filepath = self.save_car_photo(
                 best_candidate['frame'],
@@ -193,8 +222,42 @@ class PhotoManager:
         
         return True
     
+    @staticmethod
+    def _heuristic_to_garments(metadata_info: Dict[str, Any]):
+        """
+        Convert the heuristic torso/legs estimate (upper_clothing /
+        lower_clothing) into the unified `garments` shape, so every human
+        record has a single source of truth regardless of which path produced
+        it. RGB / area_ratio are unknown for the heuristic and left as None.
+
+        Returns: (garments, colors, detected_items)
+        """
+        garments: List[Dict[str, Any]] = []
+        colors: List[str] = []
+        detected_items: List[str] = []
+
+        upper = metadata_info.get('upper_clothing', {}) or {}
+        lower = metadata_info.get('lower_clothing', {}) or {}
+        up_color = (upper.get('color') or '').strip()
+        low_color = (lower.get('color') or '').strip()
+
+        if up_color:
+            garments.append({'type': 'upper-clothes', 'color': up_color,
+                             'rgb': None, 'area_ratio': None})
+            colors.append(up_color)
+            detected_items.append('shirt')
+        if low_color:
+            garments.append({'type': 'pants', 'color': low_color,
+                             'rgb': None, 'area_ratio': None})
+            if low_color not in colors:
+                colors.append(low_color)
+            detected_items.append('pants')
+
+        return garments, colors, detected_items
+
     def save_human_photo(self, frame, detection_tuple: Tuple, timestamp: datetime,
-                         color_override: Optional[Dict[str, str]] = None) -> Optional[str]:
+                         color_override: Optional[Dict[str, str]] = None,
+                         parse_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """
         Save human photo with metadata
 
@@ -204,6 +267,9 @@ class PhotoManager:
             timestamp: Detection timestamp
             color_override: Optional {'upper': color, 'lower': color} from temporal
                 voting across candidate frames (overrides single-frame estimate)
+            parse_result: Optional output of HumanParser.parse_garments — a dict
+                with 'garments', 'colors' and 'detected_items'. When present it
+                takes priority over the heuristic estimate and color_override.
 
         Returns:
             Optional[str]: Filepath if saved successfully, None otherwise
@@ -227,41 +293,44 @@ class PhotoManager:
             # Save frame
             cv2.imwrite(str(filepath), frame_copy)
             
-            # Extract metadata
-            metadata_info = self.image_analyzer.extract_metadata(
-                frame, object_type='human', bbox=bbox, mask=mask
-            )
+            # Build clothing metadata. `garments` is the SINGLE source of truth
+            # (a list of {type, color, rgb, area_ratio}); `colors` and
+            # `detected_items` are flat aggregates for fast query matching.
+            # Preferred path: SCHP-equivalent garment parse (real per-garment
+            # regions + colors). Otherwise fall back to the heuristic torso/legs
+            # estimate, converted into the same garments shape.
+            if parse_result:
+                garments = parse_result.get('garments', [])
+                colors = list(parse_result.get('colors', []))
+                detected_items = list(parse_result.get('detected_items', []))
+            else:
+                metadata_info = self.image_analyzer.extract_metadata(
+                    frame, object_type='human', bbox=bbox, mask=mask
+                )
 
-            # Apply temporal-voting colors if provided (more robust than 1 frame)
-            if color_override:
-                if color_override.get('upper'):
-                    metadata_info.setdefault('upper_clothing', {'type': 'shirt', 'color': ''})
-                    metadata_info['upper_clothing']['color'] = color_override['upper']
-                if color_override.get('lower'):
-                    metadata_info.setdefault('lower_clothing', {'type': 'pants', 'color': ''})
-                    metadata_info['lower_clothing']['color'] = color_override['lower']
+                # Apply temporal-voting colors if provided (more robust than 1 frame)
+                if color_override:
+                    if color_override.get('upper'):
+                        metadata_info.setdefault('upper_clothing', {'type': 'shirt', 'color': ''})
+                        metadata_info['upper_clothing']['color'] = color_override['upper']
+                    if color_override.get('lower'):
+                        metadata_info.setdefault('lower_clothing', {'type': 'pants', 'color': ''})
+                        metadata_info['lower_clothing']['color'] = color_override['lower']
+
+                garments, colors, detected_items = self._heuristic_to_garments(metadata_info)
 
             # Calculate quality score
             quality_score = calculate_frame_quality_score(frame, bbox, frame.shape)
-            
+
             # Create metadata entry
-            colors = []
-            upper_clothing = metadata_info.get('upper_clothing', {'type': '', 'color': ''})
-            lower_clothing = metadata_info.get('lower_clothing', {'type': '', 'color': ''})
-            if upper_clothing.get('color'):
-                colors.append(upper_clothing['color'])
-            if lower_clothing.get('color') and lower_clothing['color'] not in colors:
-                colors.append(lower_clothing['color'])
-            
             image_metadata = {
                 'filename': filename,
                 'filepath': str(filepath),
                 'object_type': 'human',
                 'track_id': int(track_id),
-                'upper_clothing': upper_clothing,
-                'lower_clothing': lower_clothing,
+                'garments': garments,
                 'colors': colors,
-                'detected_items': metadata_info.get('detected_items', []),
+                'detected_items': detected_items,
                 'timestamp': timestamp.isoformat(),
                 'hour': int(timestamp.hour),
                 'bbox': [int(x), int(y), int(w), int(h)],
